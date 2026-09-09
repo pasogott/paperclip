@@ -1,3 +1,4 @@
+import { codexExecutableReadOnlyRoots } from "./codex-security-config.js";
 import { resolve } from "node:path";
 
 import type {
@@ -14,6 +15,7 @@ import type {
   PersistedHarnessSession,
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
+import { NativeSessionProtocolIntegrityError } from "../../contracts/native-session-backend.js";
 import { HarnessReconciliationError } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
@@ -39,6 +41,7 @@ import {
   CODEX_SKILLLESS_PERMISSION_PROFILE as SKILLLESS_PERMISSION_PROFILE,
   codexCommandEnvironment,
   createIsolatedCodexAppServerArgs,
+  codexNetworkAccess,
   createSecuredCodexThreadParams,
   createSkilllessCodexThreadConfig,
 } from "./codex-security-config.js";
@@ -307,6 +310,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       // work during close; when no durable provider identity exists that
       // cleanup can fail independently.
       await cancellation.close().catch(() => {});
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (input.signal?.aborted) input.signal.throwIfAborted();
       throw error;
     } finally {
@@ -596,6 +600,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       };
     } catch (error) {
       await cancellation.close().catch(() => {});
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (options.signal.aborted) options.signal.throwIfAborted();
       return { recovered: false, reason: redactCodexDiagnostic(String(error)) };
     } finally {
@@ -616,7 +621,7 @@ export class CodexAppServerDriver implements HarnessDriver {
     return (
       this.#options.transportFactory?.(context) ??
       new ProcessCodexAppServerTransport({
-        args: createIsolatedCodexAppServerArgs(this.#options.environment),
+        args: createIsolatedCodexAppServerArgs(this.#options.environment, codexExecutableReadOnlyRoots(this.#options.environment ?? process.env)),
         environment: createSanitizedCodexEnvironment(this.#options.environment),
         onDiagnostic: this.#options.onDiagnostic,
         processGroup: true,
@@ -653,6 +658,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         },
       };
     } catch (cause) {
+      if (cause instanceof NativeSessionProtocolIntegrityError) throw cause;
       const error = new Error(
         `planning_mode_unsupported: installed Codex app-server did not expose a usable native plan collaboration mode (${redactCodexDiagnostic(String(cause))})`,
       );
@@ -702,6 +708,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       const response = await transport.request("thread/goal/get", { threadId });
       return parseThreadGoal(response.goal);
     } catch (error) {
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       const policyDisabled =
         error instanceof CodexRpcError
         && (error.message.toLowerCase().includes("policy")
@@ -807,7 +814,8 @@ export class CodexAppServerDriver implements HarnessDriver {
           rootAccess: "none",
           minimalRuntimeAccess: "read",
           workspaceAccess: requestedMode === "plan" ? "read" : "write",
-          networkAccess: false,
+          networkAccess: codexNetworkAccess(this.#options.environment),
+          githubAuthenticationMode: this.#options.environment?.PAPERCLIP_GITHUB_AUTH_MODE ?? "managed",
         },
         approvalPolicy: boundedCodexValue(
           response.approvalPolicy ??
