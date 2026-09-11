@@ -26,11 +26,22 @@ build with the new identity must rebuild layers that depend on the base image;
 later builds can reuse those layers.
 
 Verification and image building run concurrently, outside the full npm release's
-concurrency group. Different commits have independent groups. Source verification
-is initially duplicated with the normal npm release: this spends existing hosted
-runner capacity to avoid waiting behind an older release. No verification gate is
-removed from npm publication. Watch organization-wide runner queues when measuring
-the result.
+concurrency group. Different commits have independent groups. The npm canary
+release reuses `Cloud source verified v1` for the exact master push instead of
+starting a second copy of `Release Verify`. This source-only job depends on every
+source check but does not wait for Docker or migrator publication. npm canary
+publication remains possible when source verification passes and an image build
+fails. Stable releases and candidate-branch betas still run full verification.
+
+The canary consumer requires the expected workflow ID and path, upstream source
+repository, master push event, full SHA, and a successful job in the latest run
+attempt. It checks the run again after reading the jobs to reject a concurrent
+rerun. Missing proof waits for up to 45 minutes; failed, skipped, cancelled,
+ambiguous, or mismatched proof cannot authorize publication. API failures fail
+closed. If a source check fails, fix it and rerun Cloud readiness before retrying
+the release. Use **Re-run all jobs** when a later attempt did not rerun the source
+proof; an earlier attempt's successful job is not accepted. This avoids duplicate
+test jobs on standard runners. Measure queue time to assess the timing gain.
 
 Release verification spreads the general server suites across ten standard hosted
 runners, with the long chat suite split separately across three jobs. Each server
@@ -67,8 +78,9 @@ successfully verified a real master commit.
 ## Timing and rollout
 
 The reusable Runner chaos workflow scopes concurrency to the caller workflow
-and source ref. Cloud readiness and the npm release can verify the same commit
-at the same time. They must not cancel each other's required test job.
+and source ref. Cloud readiness, stable verification, and standalone evals can
+verify the same commit at the same time. They must not cancel each other's
+required test job.
 
 Measure the complete path from a master merge to a healthy target running that
 exact commit. Keep readiness and deployment as separate milestones:
@@ -110,3 +122,26 @@ registry checks can be rerun without deploying or changing mutable npm channels.
 
 When reverting this workflow, restore the master push trigger in
 `docker-cloud.yml` in the same change so master images continue to build.
+
+## AWS cloud build routing
+
+`AWS_CLOUD_BUILDS_ENABLED=true` routes the Docker cloud job to the
+`paperclip-cloud-build-x64` RunsOn Fleet for canonical `paperclipai/paperclip`
+master pushes and manual master runs. Forks, pull requests, and release tags
+retain GitHub-hosted runners. The separate `AWS_CI_ENABLED` and
+`AWS_CI_TRUSTED_USER_IDS` variables control PR routing.
+
+The cloud Fleet uses a separate runner group, `paperclip-cloud-build`, restricted
+to this repository and `.github/workflows/docker-cloud.yml@refs/heads/master`.
+Provision that group and Fleet before enabling the variable. The cloud runners
+need at least 64 GiB free for Docker and the workspace; the initial configuration
+uses 120 GiB disks with the existing 4-vCPU, 16-GiB machine size. AWS jobs have
+a 40-minute workflow timeout so they finish before the 45-minute instance
+lifetime; GitHub-hosted jobs retain their 60-minute timeout. Keep the registry
+cache and all pushed-image verification steps enabled.
+
+To roll back routing, set `AWS_CLOUD_BUILDS_ENABLED=false`, then rerun the cloud
+workflow. Changing the variable does not migrate an already assigned job.
+Check the Actions job's runner name and runner group to verify placement. Record
+queue time, image verification completion, and `Cloud deployable v1` separately;
+source verification and the migrator still run on GitHub-hosted runners.
