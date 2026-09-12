@@ -423,9 +423,9 @@ describe("TaskChatThread draft pass-through", () => {
     const thread = container.querySelector('[data-testid="task-chat-thread"]');
     expect(thread?.classList).not.toContain("h-(--tc-thread-max-h)");
     expect(thread?.classList).toContain("flex-1");
-    expect(dock?.classList).toContain("px-2");
+    expect(dock?.classList).toContain("px-1");
     expect(dock?.classList).toContain("md:px-0");
-    expect(dock?.classList).not.toContain("px-1");
+    expect(dock?.classList).not.toContain("px-2");
     expect(dock?.classList).not.toContain("-mt-(--radius-task-composer)");
     expect(dock?.classList).not.toContain("pt-1");
     expect(dock?.classList).toContain("md:pb-0");
@@ -1246,6 +1246,16 @@ describe("TaskChatThread runtime transcript selection", () => {
       );
     },
   );
+
+  it("does not render an empty response notice for a conversation reset", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
+      runId: "chat-reset", status: "succeeded", startedAt: null, resultJson: { conversationReset: true },
+      agentId: "agent-1", agentName: "Claude", adapterType: "claude_local",
+      createdAt: "2026-09-11T18:00:00.000Z", finishedAt: "2026-09-11T18:00:01.000Z",
+    }]} />);
+    expect(container.textContent).not.toContain("The runner returned no user-facing response.");
+    expect(container.textContent).not.toContain("Run completed");
+  });
 
   it.each([
     ["legacy", "issue_not_in_progress"],
