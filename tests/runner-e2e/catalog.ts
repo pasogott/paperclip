@@ -2,7 +2,7 @@ import { continuationTasks } from "./continuation-cases.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
-import { chatTasks } from "./chat-cases.js";
+import { chatTasks, chatHardeningTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
 import { createEnvironmentSchema } from "../../packages/shared/src/validators/environment.js";
@@ -811,6 +811,10 @@ function warmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
   );
   const marker = warmTurnMarker(turn, nonce);
   const finalTurn = turn === 3;
+  const reviewRequests = finalTurn ? [] : [{
+    kind: "review", ownerClass: "human",
+    summary: `Review the verified turn ${turn} workspace file and decide whether this task is ready to complete or needs another revision.`,
+  }];
   const legacyCompletion = finalTurn
     ? `In a legacy runner, make exactly one public-API completion write after verification: PATCH /api/issues/$PAPERCLIP_TASK_ID with {"status":"done","comment":"${marker}"}. Include Authorization and X-Paperclip-Run-Id. Do not POST a separate comment.`
     : `In a legacy runner, after verification POST exactly one request_confirmation to /api/issues/$PAPERCLIP_TASK_ID/interactions with {"kind":"request_confirmation","idempotencyKey":"daytona-warm-review-T${turn}-${nonce}","resolverPolicy":"human_only","title":"Warm continuity turn ${turn}","summary":"Review completed warm continuity turn ${turn}.","continuationPolicy":"wake_assignee","payload":{"version":1,"prompt":"Is this warm continuity task ready to complete after turn ${turn}?","acceptLabel":"Approve completion","rejectLabel":"Continue work","rejectRequiresReason":true,"allowDeclineReason":true,"supersedeOnUserComment":false,"target":{"type":"custom","key":"daytona_warm_turn_${turn}","revisionId":"${nonce}-T${turn}","label":"Warm continuity turn ${turn}"}}}. Capture the returned interaction id. Then make exactly one issue PATCH with {"status":"in_review","comment":"${marker}","reviewInteractionId":"<returned interaction id>"}. Include Authorization and X-Paperclip-Run-Id on both writes. If the issue PATCH fails, retry only that PATCH and never create another interaction. Do not POST a separate comment. After both writes succeed, end the response and heartbeat immediately; do not wait or poll because the reviewer action will start the next turn.`;
@@ -820,7 +824,7 @@ function warmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
       ? `Create ${file} with exactly this one line followed by a newline: ${lines[0]}`
       : `Before changing anything, read ${file} and verify its content is exactly ${lines.slice(0, -1).join("\\n")} followed by a newline. Then append exactly ${lines.at(-1)} followed by a newline.`,
     `After the write, verify ${file} contains exactly these lines, once each and in order: ${lines.join(" | ")}.`,
-    `In a native runner, use the current turn completion revision and criterion IDs (CURRENT_TURN_REVISION below is a placeholder, not a literal), then call paperclip_finish exactly once with {reportedWorkDisposition:"${finalTurn ? "done" : "needs_review"}",summary:"${marker}",completionClaim:{contractRevision:CURRENT_TURN_REVISION,objectiveSatisfied:true,criteria:[{criterionId:"objective",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},evidence:[],verification:[{commandOrCheck:"read ${file}",status:"passed"}]}. Wait for that tool call to succeed, then emit exactly ${marker} once as the complete user-facing final response.`,
+    `In a native runner, use the current turn completion revision and criterion IDs (CURRENT_TURN_REVISION below is a placeholder, not a literal), then call paperclip_finish exactly once with {reportedWorkDisposition:"${finalTurn ? "done" : "needs_review"}",summary:"${marker}",completionClaim:{contractRevision:CURRENT_TURN_REVISION,objectiveSatisfied:true,criteria:[{criterionId:"objective",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},attentionRequests:${JSON.stringify(reviewRequests)},evidence:[],verification:[{commandOrCheck:"read ${file}",status:"passed"}]}. Wait for that tool call to succeed, then emit exactly ${marker} once as the complete user-facing final response.`,
     legacyCompletion,
     `In a legacy runner, the PATCH comment is the complete visible response. After its 2xx response, finish silently: do not print, echo, or emit ${marker} again as assistant text.`,
     `Do not include ${marker} in any other visible response or write. Do not recreate, truncate, reorder, or duplicate prior lines.`,
@@ -944,7 +948,18 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)).map(defaultPermissionProfile),
     environments: [localEnvironment], tasks: chatTasks, expectedMatrixSize: 28,
     excludedExecutionIds: ["legacy-codex", "legacy-claude"].flatMap(profile => ["reassign-task", "create-backlog"].map(task => `agent-chat.${profile}.local.${task}`)),
-    definitionMetadata: { version: 4, resetRunsCountedSeparately: true, permissions: "production-defaults" },
+    definitionMetadata: { version: 6, resetRunsCountedSeparately: true, permissions: "production-defaults", stopBoundary: "provider-turn-started", restartMemory: "required-after-restart" },
+  },
+  {
+    id: "agent-chat-hardening", label: "Agent Chat Recovery and Coordination", manualOnly: true,
+    description: "Native chat startup cancellation, committed sends, hiring, grounded status, and remote continuity.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment, daytonaWarmEnvironment], tasks: chatHardeningTasks, expectedMatrixSize: 18,
+    excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
+      ["stop-startup-new-resume", "hire-delegate-reuse", "blocked-status-review"].map(task => `agent-chat-hardening.${profile}.daytona.${task}`)),
+    definitionMetadata: { version: 4, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations" },
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
