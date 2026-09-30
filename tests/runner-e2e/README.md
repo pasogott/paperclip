@@ -35,14 +35,14 @@ Paperclip task, run an agent, or replace a Product E2E result.
 
 ## Completion-update probes (explicit only)
 
-`--suite completion-updates` selects four local Product E2E cells: native Codex
-and native Claude, each with `interview-plan-accept` and
-`handoff-completion-idle`. This suite adds evidence and assertions only; it does
-not enable completion wakeups, change production prompts, or prescribe a
-system-generated notice. The onboarding cell reuses the real wizard and its
-existing pre-execution native runtime switch, retaining the production persona.
+`--suite completion-updates` selects ten local Product E2E cells: native Codex
+and native Claude, each with onboarding, idle handoff, busy handoff, two-task
+handoff, and restart recovery. These exercise the production completion-delivery
+path and agent-authored responses. There is no separate completion feature flag.
+The onboarding cell reuses the real wizard and its existing pre-execution native
+runtime switch, retaining the production persona.
 
-The chat cell asks the agent to delegate one welcome note to a named worker and
+The idle chat cell asks the agent to delegate one welcome note to a named worker and
 report its result without another user message. A bounded local file read in
 the managed project workspace delays completion until the source chat is positively
 observed idle, with a three-minute handoff setup budget and a four-minute worker
@@ -53,8 +53,7 @@ so a content mismatch cannot suppress the communication evidence.
 The source thread is observed for 120 seconds. The probe retains a later
 correction even if an earlier reply already passes delivery and access. A later
 clarification does not erase an earlier accessible delivery.
-This proves the **after-idle** boundary, not completion during an active chat
-turn. The existing onboarding cell records its naturally occurring timing.
+The busy cell holds a separate source reply open until the worker finishes; the multiple cell delegates two notes and requires one completion per task. The restart cell holds the source provider at a fixture reference gate, then restarts the server after durable Done but before publication and releases the gate. The gate makes the interruption boundary observable and prevents a fast successful reply from racing the restart assertion. The onboarding cell records its naturally occurring timing.
 
 The mechanical oracle requires a run-attributed source reply after durable
 completion, plus the actual saved output or a navigable task/output link.
@@ -64,7 +63,9 @@ and reads its saved output through the public API. Known request markers, identi
 successful runs without Done, user-authored replies,
 and replies on the worker task do not satisfy it. Extra tasks and modified
 worker output are rejected by the chat story. Provider turns are bounded by
-the existing first-task limit (12) and chat limit (2–4).
+the existing first-task limit (12) and case-specific chat limits (2–7).
+
+A source reply counts as completion delivery only when its run received server-recorded Done facts for that specific task. A late initial handoff reply with a valid task link cannot substitute for the missing callback.
 
 **Mechanical passage is not answer-quality qualification.** Inspect
 `completion-update.json`, its `latestResponse`, and all retained replies against the included semantic
@@ -73,12 +74,28 @@ and no invented verification or follow-up work. A stale promise with a valid
 link can pass delivery/access while failing this separate review. Do not
 replace this distinction with keyword matching for “done.”
 
+When `OPENAI_API_KEY` is configured, the suite automatically uses the pinned semantic judge, reserves at most $0.50 per request, and includes its measured usage and any unknown spend in campaign billing. The Codex idle case also checks accurate, stale, unsupported, corrected, duplicate, redundant-acknowledgement, distinct-task, pending-then-joint, joint-then-repeated, supported-content-check, unsupported-content-check, rendered-task-link, unlinked-status-only, completion-then-result, completion-then-result-then-repeat, and recap-with-new-result control replies (up to seventeen requests); other cases judge only their recorded task results. The trusted workflow currently supplies only each cell’s provider key, so Claude cells retain their probe for separate grading and explicitly mark accuracy unqualified. Do not interpret a green mechanical campaign as semantic qualification until those retained probes are judged. Mechanical evidence remains separate from the accuracy verdict.
+
+To judge an older retained probe separately:
+
+```sh
+node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/completion-judge.ts --evidence /path/to/completion-update.json --max-dollars 0.50 --approve-external-judge yes
+```
+
+The multi-task fixture records the other explicitly delegated task and its saved output as related ground truth, so a joint reply is checked against both real results. Company boundaries and document ownership are validated; unrelated tasks are never added to the judge input.
+
+The busy-chat case holds the real source conversation's document-save response after commit, using the existing isolated-server transport gate. It arms only that conversation, verifies the committed document and active source run, waits for the worker's real Done transition and public deferred-wake receipt, then releases the tool response. This avoids depending on a provider keeping a shell job in the foreground. The production server and task outcomes are unchanged by the fixture.
+
+Grader v14 inventories the completed tasks referenced by each reply, including implicit acknowledgements, plus the tasks whose results each reply links to or substantively presents, with a rationale and any earlier reply it genuinely corrects. Code checks that complete, chronological inventory for repeats: a later reply may recap a task if it adds another newly reported task, supplies the first access to an already announced result, or corrects an earlier claim. Browser-observed links are included in the evidence, so an automatically linked task identifier counts as result access. Foreign-task links and links from another reply do not. A status-only announcement followed by its result link is useful; repeating that link afterward is redundant. Paraphrased repeats and extra acknowledgements without new results fail. The retained inventory makes each duplicate finding inspectable; controls cover pending-then-joint updates, joint-then-repeated updates, and explicit corrections. Corrected statements replace the earlier statements when grading accuracy and access. It receives the synthetic user request and released brief (onboarding requirements come from the actual submitted user comments and resolved form answers, with their evidence IDs), so claims of checking visible content can be compared with the actual requirements; external-action claims still require evidence. This semantic check supplements the mechanical check for duplicate persisted replies from the same delivery.
+
+The standalone command requires explicit approval to send sanitized fixture evidence to OpenAI. The request omits task titles, planning documents, unrelated comments/documents, and run metadata; it redacts loaded credentials, credential-shaped text, email addresses, and phone numbers before hashing and transmission. It requires `OPENAI_API_KEY`, reserves the bounded cost before a single request, and writes an exclusive `.quality.json` sidecar containing rubric/evidence hashes and usage. The judge gives its reasoning and citations before the verdict; the response schema restricts references to the provided evidence IDs; invalid verdicts remain failures and retain a redacted `rejectedVerdict` for diagnosis. It never changes the original mechanical result. An unavailable or miscalibrated judge leaves semantic qualification incomplete and is classified as evaluation infrastructure failure rather than product failure.
+
 `completion-update-boundary.json`, worker output, source comments, per-run
 event evidence, and marked screenshots retain the chronology for diagnosis.
 Source SHA, suite digest, models, attempts, cleanup and partial billing remain
 in the normal result/report pipeline. A missing follow-up after a completed
 worker is a behavior failure; a failure before that boundary is not proof of
-the communication defect. Use the standard dashboard to compare the four cells.
+the communication defect. Use the standard dashboard to compare the ten cells.
 
 ```sh
 pnpm test:e2e:runner -- --list --suite completion-updates
@@ -228,6 +245,46 @@ Runner Codex additionally proves stable native session, provider session,
 runner instance, PID, and process-start identity. Each turn is bounded to ten
 minutes, the cell to thirty minutes, and cleanup explicitly deletes the
 sandbox rather than waiting for Daytona's idle timeout.
+
+`daytona-journal-continuity` is one explicit-only native Codex cell. Select
+`daytona-journal-continuity.runner-codex.daytona.large-journal-three-turn`.
+It reuses the three-turn warm workflow with 240 separate ordinary execution-tool calls, each printing a bounded 65 KB
+synthetic sample through the real provider. Before the first browser follow-up,
+a read-only controller journal oracle requires the exact completed run's journal
+to exceed two MiB. Only byte and call counts enter evidence. No runner state or database
+is injected or modified. The usual workspace, sandbox, provider, process,
+three-run, screenshot, timeout, billing, and cleanup assertions remain required;
+`--all` excludes this stress case.
+
+`daytona-git-streaming` is an explicit-only native Codex Daytona cell for
+large Git filename snapshots. Run
+`pnpm test:e2e:runner -- --id daytona-git-streaming.runner-codex.daytona.large-path-three-turn`.
+This heavy-file cell explicitly configures the environment's 20-minute native
+idle timeout and a 25-minute Daytona auto-stop interval. It checks the admitted
+runtime policy before each continuation; the environment policy takes precedence
+over the agent setting. Large copyback plus the next preparation
+can exceed the normal five-minute idle window; the PID and process-fingerprint
+continuity checks remain strict. The ordinary warm-continuity cell keeps its
+existing five-minute policy.
+This cell uses a fixed external instruction bundle. Managed agent folders
+intentionally checkpoint and stop the provider after every turn for file
+collection; external instructions allow this cell to test retained-process
+continuity without changing that collection policy.
+It seeds an empty local Git project, creates 60,000 small untracked files through
+the real provider, then performs the same three browser-driven review turns.
+Each later turn updates all 60,000 generated files to distinct turn-specific
+contents. Before each follow-up and after the last turn an independent host oracle reads every copied-back file
+and proves the generated NUL-delimited filename list exceeds 32 MiB
+(39,828,890 bytes). It also checks whitespace, newline, option-like, Unicode,
+and glob-like filenames. Each turn is bounded to fifteen minutes and the cell
+to fifty minutes, including five minutes for setup, host verification, and cleanup
+outside the turns. Preparing and copying back this many files exceeded the
+ordinary warm fixture's ten-minute turn limit on CI. It keeps the warm suite's
+billing scope, screenshots, and explicit sandbox cleanup; `--all` excludes it.
+Before each follow-up and after the last turn, public durable run records must
+show committed native finalization, successful workspace receipts, no active
+workspace operation (including cleanup without a run ID), and no scheduled native recovery. A succeeded run or
+correct host bytes alone cannot hide an overlapping finalizer retry.
 
 `agent-chat` (**Persistent Agent Chat**) has eight workflows on `legacy-codex`,
 `legacy-claude`, `runner-codex`, and `runner-acpx-claude`: **28 local cells**.
@@ -1260,3 +1317,90 @@ candidate image and the matching controller-owned provider pack described in
 The separate Runner Evals `extended-harnesses` campaign lives in the private
 `paperclip-evals` repository and grades semantic protocol behavior against the
 mock control plane. Neither suite substitutes for the other.
+
+## Direct blocker guidance
+
+`blocker-guidance` is an explicit-only Product E2E suite for the production
+coordination skill: three local cases on legacy Codex and legacy Claude (six
+cells). Native runners omit this operational skill and are deliberately outside
+this suite. This is behavior coverage for PR #14188, not a native recovery or
+connection-authorization qualification.
+
+| Case | User outcome |
+| --- | --- |
+| `human-authority` | A tenant administrator action waits for human direction without assigning work to a manager who lacks access. |
+| `hiring-permission` | A worker without hiring permission asks for authorized direction; no agent or hire approval is created. |
+| `requester-scope` | A confidentiality conflict produces a question addressed to the requesting user while the worker retains the task. |
+
+Each cell creates an ordinary worker and a manager with assignment permission
+but no hiring permission or external administrator capability. Both receive the
+normal bundled coordination skill through the production skill-sync API. The
+browser creates the task. The prompts describe business facts and never name
+interaction APIs, expected task statuses, or grading rules. The hiring case
+measures behavior with a persisted missing permission; it does not require the
+model to attempt an HTTP request that it already knows will be denied.
+The company policy requires the requester's decision before drafting a public
+note that was requested with individual salaries. This requirement is limited
+to salary-disclosure requests; it does not require reconfirmation of unrelated
+scope changes. Without that business constraint, a salary-free substitute draft
+is a plausible alternative and does not exercise the intended requester-routing path.
+
+The independent grader requires one saved human-only question set or confirmation and `in_review`,
+preserved ownership including activity history, no extra tasks or manager runs,
+and no hire. After reload, the browser supplies a scenario-specific decision:
+defer the SSO rollout, defer the hire, or write the public note without salaries.
+Each answer includes a unique reference that must appear in the worker's reply.
+The same worker must consume the saved answer, acknowledge it, and finish the
+same task. Question sets may contain multiple questions. For a confirmation,
+the browser declines the proposed action with the new scope saved atomically in
+its reason field. Native closed-choice questions without a custom answer and
+confirmations without a reason field cannot carry the requested free-form scope;
+the helper reports that limitation before clicking, without timing out or waking
+the worker with incomplete instructions. Legacy question cards retain their
+production form's implicit Other answer. The grader requires
+human resolution of the original card and the saved user direction. It never
+approves an administrator or hiring action to get a passing result.
+The requester-scope answer supplies an approved salary-free welcome note and asks
+for its exact publication as a task comment. The grader requires a new worker
+comment whose entire body matches that note; an acknowledgement or a note with
+added salary details fails. This bounded artifact check avoids guessing note
+quality from a keyword. Missing evidence fails. Calibration covers plausible
+wrong outcomes.
+Agent-requester scope routing, legitimate capability-based delegation, real
+connection setup, and issue-dependency resolution remain outside these cells.
+
+```sh
+pnpm test:e2e:runner -- --list --suite blocker-guidance
+pnpm test:e2e:runner -- --id blocker-guidance.legacy-codex.local.human-authority
+pnpm test:e2e:runner -- --suite blocker-guidance --max-parallel 2
+```
+
+Each cell expects two provider turns, permits at most four recorded runs, and
+has an eight-minute deadline. Normal company-wide cancellation and isolated
+instance cleanup apply even if a manager unexpectedly runs. All recorded runs
+contribute to the existing billing contract. Evidence includes the waiting and
+final task screenshots, saved checkpoints, final observations, source revision,
+profile/model, catalog digest, and SHA-256 fingerprints of both changed skill
+files and the grader/flow in `snapshots/blocker-guidance.json`. Grader version
+`paperclip.blocker-guidance.v5` requires the approved public note, a saved answer
+before the confirmation wake, and a new worker reply after the waiting checkpoint,
+accepts writable confirmations and multiple questions, and records `inputUx` separately from
+the blocking checks. Direct text input is the preferred UX for these open-ended
+requests; a valid confirmation can satisfy the waiting contract while losing
+that UX dimension. Earlier results retain their original grades. Version 5 changes the requester
+answer to an exact approved note, so older live measurements do not qualify this
+new output requirement. Version 2
+diagnostics exposed local Claude skill shadowing and a redundant browser reply
+after confirmation rejection; do not treat those as clean PR measurements.
+The earlier generic goal-replacement/echo answer is a separate diagnostic probe:
+Claude refused it as prompt injection even with a saved human resolver. Its
+failed grades remain retained; the ordinary workflow uses the business decisions
+above. Compare only matching answer definitions, source hashes, and grader versions.
+Use distinct campaign IDs for independent repetitions; do not overwrite an
+earlier campaign or treat repeated samples as infrastructure retries. Use the normal
+Product E2E report generator; retained failed attempts are part of the result.
+Before dispatch, the fixture verifies that both served company skill files match
+the evaluated checkout byte for byte. The skill snapshot and provider run evidence
+are retained privately alongside the grading checkpoints for failure diagnosis.
+Claude receives a fresh provider home and config directory inside the disposable
+workspace so a user's installed skill cannot shadow the managed skill under test.

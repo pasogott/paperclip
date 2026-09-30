@@ -15,6 +15,7 @@ export type RunnerGeneration = "legacy" | "native";
 export type RunnerEnvironmentId = "local" | "daytona";
 export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
+  | "blocker_guidance"
   | "everyday_workflow"
   | "context_integrity"
 
@@ -320,6 +321,7 @@ export interface RunnerE2EResult {
     sha256?: string;
   }>;
   firstTask?: import("./first-task-scoring.js").FirstTaskEvidence;
+  completionQuality?: import("./completion-quality.js").CompletionQualityRecord[];
   firstTaskQuality?: import("./first-task-quality.js").FirstTaskQuality;
   cleanup: "not_started" | "passed" | "failed";
 }
