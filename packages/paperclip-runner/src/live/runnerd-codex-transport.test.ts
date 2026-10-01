@@ -737,9 +737,10 @@ it("refuses a reusable close checkpoint when the local provider snapshot is unre
   }
 }, 15_000);
 
-it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
+it.each(["after_budget", "within_budget", "interrupted_within_budget", "persistence_failure"] as const)(
   "fences reusable suspension against late semantic completion (%s)",
   async (mode) => {
+    const settles = mode === "within_budget" || mode === "interrupted_within_budget";
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "runnerd-late-semantic-close-"),
     );
@@ -760,23 +761,26 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
       // The default 96/48-frame stress burst spends seconds on unrelated
       // durable text fsyncs before handler entry, consuming this barrier test's
       // wall-clock budget under the full suite. Stress cases retain defaults.
-      codexArgs: fakeCodexArgs(
+      codexArgs: mode === "interrupted_within_budget"
+        ? fakeCodexArgs(stateDirectory, "--emit-tool-call")
+        : fakeCodexArgs(
         stateDirectory, "--split-event-burst",
         "--split-event-prefix-count", "2", "--split-event-suffix-count", "2",
       ),
       stateDirectory,
-      closeGraceMs: 2_000,
+      closeGraceMs: 5_000,
       controlPlaneRegistration: async (authority) => {
         core = authority;
         await authority.start();
         return { checkpoint, release: () => undefined };
       },
     });
-    bundle.transport.setServerRequestHandler(async () => {
+    const handler = vi.fn(async () => {
       entered();
       await handlerRelease;
       return { success: true, contentItems: [] };
     });
+    bundle.transport.setServerRequestHandler(handler);
     try {
       await bundle.transport.request("thread/start", {
         cwd: tmpdir(),
@@ -815,6 +819,10 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
           return queue(type, ...args);
         });
       }
+      if (mode === "interrupted_within_budget") {
+        await bundle.transport.request("turn/interrupt", { reason: "test-stop-during-server-write" });
+        expect(core.semanticToolResultsSettled()).toBe(false);
+      }
       const closing = bundle.transport.close().then(
         () => null,
         (error: unknown) => error,
@@ -825,7 +833,8 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
         release();
       }
       const closeFailure = await closing;
-      if (mode !== "within_budget") {
+      expect(handler).toHaveBeenCalledTimes(1);
+      if (!settles) {
         const artifact = readRunnerdArtifactBinding(
           defaultCapabilityRunnerdBinary(),
         );
@@ -863,9 +872,9 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
             control.identity.runId,
           );
           expect(late[0].status).toBe(
-            mode === "within_budget" ? "completed" : "pending",
+            settles ? "completed" : "pending",
           );
-          if (mode === "within_budget") {
+          if (settles) {
             const results = control.committedEvents.filter(
               (event: { eventType: string }) =>
                 event.eventType === "semantic_tool.result",
@@ -875,7 +884,7 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
           }
         });
       }
-      if (mode === "within_budget") {
+      if (settles) {
         expect(closeFailure).toBeNull();
         expect(core.semanticToolResultsSettled()).toBe(true);
         expect(checkpoint).toHaveBeenCalledWith("settled");
@@ -883,6 +892,10 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
         expect(closeFailure).toBeInstanceOf(
           NativeSessionCloseUnrecoverableError,
         );
+        expect(closeFailure).toHaveProperty("settlement.semanticTools.pending", expect.arrayContaining([
+          expect.objectContaining({ callId: expect.any(String), operationId: expect.any(String),
+            sourceEventId: expect.any(String), inputDigest: expect.stringMatching(/^[a-f0-9]{64}$/) }),
+        ]));
         expect(checkpoint).toHaveBeenCalledWith("unsettled");
         expect(checkpoint).not.toHaveBeenCalledWith("settled");
       }
@@ -892,7 +905,7 @@ it.each(["after_budget", "within_budget", "persistence_failure"] as const)(
       await rm(stateDirectory, { recursive: true, force: true });
     }
   },
-  15_000,
+  25_000,
 );
 
 it("infers a remote provider turn until its own terminal event is durable", () => {
@@ -7514,13 +7527,22 @@ it.each([true, false])("preserves prepared OpenCode cleanup errors (primary fail
 
 it("preserves prepared input through runnerd and the real OpenCode proxy boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-prepared-opencode-"));
+  // GitHub-hosted Linux toolcache Node can be group-writable, unlike the AWS
+  // fleet. Qualify an owned copy with strict permissions, never chmod the host
+  // runtime or weaken the launch boundary. Keep macOS's native runtime path
+  // because its signing and dylib lookup can depend on that location.
+  const providerNode = process.platform === "linux" ? join(root, "node") : process.execPath;
+  if (process.platform === "linux") {
+    await cp(process.execPath, providerNode);
+    await chmod(providerNode, 0o500);
+  }
   // The qualified launch boundary unlinks its executable after exec. Use a
   // native wrapper, like the real OpenCode binary; a shebang script would need
   // to reopen the now-unlinked path in its interpreter.
   const executable = join(root, "fake-opencode");
   const fixture = resolve("test/fixtures/fake-opencode-server.mjs");
   execFileSync("cc", ["-x", "c", "-o", executable, "-"], {
-    input: `#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { char **args = calloc(argc + 2, sizeof(char *)); args[0] = ${JSON.stringify(process.execPath)}; args[1] = ${JSON.stringify(fixture)}; for (int i = 1; i < argc; i++) args[i + 1] = argv[i]; execv(args[0], args); return 127; }`,
+    input: `#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { char **args = calloc(argc + 2, sizeof(char *)); args[0] = ${JSON.stringify(providerNode)}; args[1] = ${JSON.stringify(fixture)}; for (int i = 1; i < argc; i++) args[i + 1] = argv[i]; execv(args[0], args); return 127; }`,
   });
   // CI may use umask 0002; qualified executables cannot be group-writable.
   await chmod(executable, 0o755);
@@ -7545,8 +7567,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand: providerNode,
+    providerNodeCommandSha256: digest(providerNode),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({

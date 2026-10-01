@@ -49,6 +49,7 @@ import {
   testAdapterEnvironmentSchema,
   // Issue
   createIssueSchema,
+  setIssueTitleSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
   createIssueLabelSchema,
@@ -146,6 +147,10 @@ import {
   probeEnvironmentConfigSchema,
   startEnvironmentCustomImageSetupSessionSchema,
   // Company skills
+  skillSourceDiscoverySchema,
+  skillSourcePreviewSchema,
+  skillSourceCreateSchema,
+  skillSourceSelectionSchema,
   companySkillCreateSchema,
   companySkillFileDeleteSchema,
   companySkillFileUpdateSchema,
@@ -173,6 +178,7 @@ import {
   createIssueThreadInteractionSchema,
   createChildIssueSchema,
   acceptIssueThreadInteractionSchema,
+  resolveConfirmationFromCommentSchema,
   rejectIssueThreadInteractionSchema,
   respondIssueThreadInteractionSchema,
   skipIssueThreadInteractionSchema,
@@ -3899,6 +3905,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "Create an issue",
+  description: "Title is optional when description contains the task prompt. The server seeds a provisional title from the first 120 characters of the whitespace-normalized prompt and asks the assigned agent to refine it early. Explicit titles are preserved.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createIssueSchema),
@@ -3918,6 +3925,16 @@ registry.registerPath({
   summary: "Get an issue",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/issues/{id}/title",
+  tags: ["issues"],
+  summary: "Set a task title",
+  description: "Changes only the title. onlyIfProvisional preserves an explicit title, including concurrent user edits. Agent callers must own the task's active run. Allowed in Ask and Plan modes.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(setIssueTitleSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -7361,6 +7378,20 @@ registry.registerPath({
     body: jsonBody(createIssueThreadInteractionSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/resolve-from-comment",
+  tags: ["issues"],
+  summary: "Record a user's conversational confirmation answer",
+  description: "An eligible active agent run resolves a confirmation on its own task using the latest user comment. Resolver permissions, target staleness and conversation reset boundaries remain enforced. Matching retries are idempotent. No new wake is scheduled.",
+  request: {
+    params: z.object({ id: z.string(), interactionId: z.string() }),
+    body: jsonBody(resolveConfirmationFromCommentSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: { description: "Stale or conflicting decision" }, 422: { description: "Invalid answer evidence or selection" } },
 });
 
 registry.registerPath({
@@ -11526,4 +11557,30 @@ registerCurrentRoute({
   tags: ["ai-connections"], summary: "Check the local operator's subscription sign-in without saving a connection",
   body: localAiConnectionSchema,
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+for (const [method, path, summary] of [
+  ["get", "/api/companies/{companyId}/skill-sources", "List GitHub skill sources"],
+  ["get", "/api/companies/{companyId}/skill-sources/repositories", "Browse authorized GitHub repositories for skills"],
+  ["get", "/api/companies/{companyId}/skill-sources/{sourceId}", "Get a skill source and entries"],
+  ["post", "/api/companies/{companyId}/skill-sources/discover", "Discover and validate repository skills"],
+  ["post", "/api/companies/{companyId}/skill-sources/preview", "Preview an audited skill package file at an immutable commit"],
+  ["post", "/api/companies/{companyId}/skill-sources", "Import a GitHub skill source"],
+  ["patch", "/api/companies/{companyId}/skill-sources/{sourceId}", "Save skill source selection and connection"],
+  ["post", "/api/companies/{companyId}/skill-sources/{sourceId}/refresh", "Refresh installed source skills"],
+  ["delete", "/api/companies/{companyId}/skill-sources/{sourceId}", "Disconnect a skill source and retain installed skills"],
+] as const) registerCurrentRoute({
+  method, path, tags: ["skills"], summary,
+  ...(method === "patch" ? { body: skillSourceSelectionSchema }
+    : method === "post" && path.endsWith("/discover") ? { body: skillSourceDiscoverySchema }
+    : method === "post" && path.endsWith("/preview") ? { body: skillSourcePreviewSchema }
+    : method === "post" && path.endsWith("/skill-sources") ? { body: skillSourceCreateSchema } : {}),
+  responses: {
+    [method === "post" && path.endsWith("/skill-sources") ? 201 : 200]: path.endsWith("/discover") ? {
+      description: "JSON discovery by default. Accept: application/x-ndjson streams progress (phase, measured Git download percentages, and package/file counts), candidate metadata, then complete with discovery. An error event terminates a failed scan; partial candidates cannot be imported. Disconnecting cancels further provider reads.",
+      content: { "application/json": { schema: z.unknown() }, "application/x-ndjson": { schema: z.string() } },
+    } : r.ok(),
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden,
+    404: r.notFound, 409: r.conflict, 422: r.unprocessable,
+  },
 });

@@ -194,7 +194,6 @@ export const runnerApiReference: Record<string, { section: string; description?:
           "kind": "ask_user_questions",
           "idempotencyKey": "questions:{issueId}:responsibility-text:v1",
           "title": "Hire responsibility",
-          "addresseeUserId": "{requesting-user-id}",
           "resolverPolicy": "human_only",
           "continuationPolicy": "wake_assignee",
           "payload": {
@@ -233,7 +232,6 @@ export const runnerApiReference: Record<string, { section: string; description?:
           "kind": "ask_user_questions",
           "idempotencyKey": "questions:{issueId}:responsibility:v1",
           "title": "Hire responsibility",
-          "addresseeUserId": "{requesting-user-id}",
           "resolverPolicy": "human_only",
           "continuationPolicy": "wake_assignee",
           "payload": {
@@ -374,6 +372,10 @@ export const runnerApiReference: Record<string, { section: string; description?:
         }
       }
     ]
+  },
+  "POST /api/issues/{}/interactions/{}/resolve-from-comment": {
+    "section": "Issues (Tasks)",
+    "description": "Resolve a confirmation from the latest user reply; body: commentId, decision (accept/reject), selectedOptionIds for checkbox acceptance, optional reason"
   },
   "POST /api/issues/{}/interactions/{}/accept": {
     "section": "Issues (Tasks)",

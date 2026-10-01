@@ -457,12 +457,46 @@ The shared reporter also attaches bounded diagnostic contexts for both legacy
 and native runs:
 
 - `run_execution`: runtime mode, execution stage/native phase, driver and version,
-  duration, failure phase, stop reason, error family, and timeout settings when available.
+  duration, ACP activity, failure phase, stop reason, error family,
+  and timeout settings when available.
 - `adapter_failure`: selected adapter error fields such as phase, category,
   protocol code, retryability, cause message, stack preview, HTTP status, and request ID.
 - `provider_failure`: the saved provider failure category, title, and details.
 - `run_exception_0` through `run_exception_3`: exception names, codes, HTTP
   statuses, and request IDs for a caught exception and up to three causes.
+
+ACP turns record `acpLastEventAgeMs`, `acpObservedEventCount`,
+`acpPendingToolCount`, and `acpToolInventoryComplete` at finalization, before
+usage reads, error logging, and cleanup. The age measures time since the last
+runtime event and is omitted if no event was observed or the clock is invalid.
+Timeout and cleanup log messages do not reset this age. The pending count uses
+known tool statuses; an incomplete inventory cannot establish that no work is
+pending. Recent events do not prove useful progress. These fields contain only
+numbers and a boolean, never tool names, IDs, arguments, or event content, and
+do not change the execution timeout, cancellation, or recovery policy.
+
+When settlement records a workspace restore failure, `run_execution` also
+includes `workspaceRestoreFailure` with one of the shared, path-free codes:
+`restore_permission_denied`, `restore_lock_timeout`, `restore_unsafe_archive`,
+or `restore_failed`. Unknown values are omitted. Workspace paths and arbitrary
+pre-restore result data are not included. A later successful run does not, by
+itself, establish that an earlier failed restore recovered the workspace files.
+
+A caught directory-merge lock timeout also records `restoreLockOwnerState`
+(`alive`, `dead`, `unknown`, `missing`, or `invalid`), `restoreLockKnownLocalHolder`,
+and, when available, `restoreLockOwnerSameProcess`, `restoreLockOwnerPredatesProcess`,
+`restoreLockOwnerAgeMs`, and `restoreLockWaitMs` in `run_execution`. Ages are capped
+at seven days. These fields omit paths, PIDs, owner records, and absolute timestamps.
+The local-holder flag covers this module's active acquisitions only. Process-age
+comparison uses the wall clock and a one-second margin; it is a clue to PID reuse,
+not proof of ownership or permission to remove a lock. Diagnostic reads can race
+with release. The extra diagnostic owner read has a 100 ms budget; a stalled or
+unreadable read leaves the owner state `unknown`, while malformed JSON is `invalid`.
+These fields do not change lock acquisition, reclamation, or retries.
+Agent-directory callers also supply `restoreLockOperation`: `agent_directory_release`,
+`agent_directory_collect`, `agent_directory_checkpoint`, or `agent_directory_handoff`.
+This identifies the operation waiting for the lock, including cleanup after a
+completed adapter turn when the recorded execution stage has not advanced.
 
 The execution and setup catch paths pass the original exception to the reporter.
 It snapshots and rebuilds only these selected fields and the original message and
