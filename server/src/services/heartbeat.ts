@@ -1,3 +1,4 @@
+import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironmentProjection } from "../vendor/paperclip-runner/index.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
@@ -1495,6 +1496,7 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
 // 3. Any other PAPERCLIP_*-named binding is user data and flows through to
 //    the run env like any non-prefixed binding.
 const FORBIDDEN_ENV_BINDING_KEYS = new Set([
+  CONFIGURED_ENVIRONMENT_KEYS,
   "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
   "PAPERCLIP_RUNNER_NETWORK_ACCESS",
   "PAPERCLIP_RUNNER_NETWORK_ROOTS",
@@ -1950,6 +1952,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
   }
   return {
     resolvedConfig,
+    // Capture resolved task values before provider credential injection or host
+    // inheritance. Native-only launch limits are checked at native dispatch.
+    configuredTaskEnvironment: Object.fromEntries(
+      Object.entries(parseObject(resolvedConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    ),
     secretKeys,
     secretManifest: [
       ...(environmentEnvResolution.manifest ?? []),
@@ -3786,6 +3793,8 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    monitorNextCheckAt?: string;
+    monitorWakeRequestedAt?: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -11661,18 +11670,19 @@ export function heartbeatService(
     runId: string | null;
     activitySource: "manual" | "scheduled";
   }) {
-    await db
+    const cleared = await db
       .update(issues)
       .set({
-        ...buildIssueMonitorClearedPatch({
+        ...monitorOnlyDispatchPatch(buildIssueMonitorClearedPatch({
           issue: input.claimed,
           policy: input.policy,
           clearReason: input.clearReason,
           clearedAt: input.now,
-        }),
+        })),
         updatedAt: input.now,
       })
-      .where(eq(issues.id, input.claimed.id));
+      .where(issueMonitorClaimCondition(input.claimed)).returning({ id: issues.id });
+    if (cleared.length === 0) return { outcome: "skipped" as const, reason: "monitor_replaced" };
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -11709,6 +11719,24 @@ export function heartbeatService(
     });
 
     return { outcome: "skipped" as const, reason: input.clearReason };
+  }
+
+  function monitorOnlyDispatchPatch<T extends ReturnType<typeof buildIssueMonitorClearedPatch>>(patch: T) {
+    // Admission and consumption are separate transactions. Preserve any review
+    // policy/state changes made between them; only the monitor belongs to us.
+    return {
+      ...patch,
+      executionPolicy: sql`nullif(${issues.executionPolicy} - 'monitor', '{}'::jsonb)`,
+      executionState: sql`jsonb_set(coalesce(${issues.executionState}, ${JSON.stringify(patch.executionState)}::jsonb),
+        '{monitor}', ${JSON.stringify(patch.executionState?.monitor ?? null)}::jsonb)`,
+    };
+  }
+
+  function issueMonitorClaimCondition(claimed: IssueMonitorDispatchRow) {
+    return and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId),
+      eq(issues.assigneeAgentId, claimed.assigneeAgentId!), isNull(issues.assigneeUserId),
+      eq(issues.status, claimed.status), eq(issues.monitorNextCheckAt, claimed.monitorNextCheckAt!),
+      eq(issues.monitorWakeRequestedAt, claimed.monitorWakeRequestedAt!));
   }
 
   async function dispatchClaimedIssueMonitor(
@@ -11855,8 +11883,10 @@ export function heartbeatService(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
-      } else
-        await enqueueWakeup(targetAgentId, {
+      } else {
+        const wake = await enqueueWakeup(targetAgentId, {
+          issueStateGuard: { statuses: [claimed.status], assigneeAgentId: claimed.assigneeAgentId,
+            monitorNextCheckAt: scheduledAtIso, monitorWakeRequestedAt: claimed.monitorWakeRequestedAt!.toISOString() },
           source: input.source,
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
@@ -11886,18 +11916,26 @@ export function heartbeatService(
             manualTrigger: input.activitySource === "manual",
           },
         });
+        if (!wake) {
+          await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+            .where(issueMonitorClaimCondition(claimed));
+          return { outcome: "skipped" as const, reason: "monitor_dispatch_deferred" };
+        }
+      }
 
-      await db
+      const consumed = await db
         .update(issues)
         .set({
-          ...buildIssueMonitorTriggeredPatch({
+          ...monitorOnlyDispatchPatch(buildIssueMonitorTriggeredPatch({
             issue: claimed,
             policy,
             triggeredAt: input.now,
-          }),
+          })),
           updatedAt: new Date(),
         })
-        .where(eq(issues.id, claimed.id));
+        .where(issueMonitorClaimCondition(claimed))
+        .returning({ id: issues.id });
+      if (consumed.length === 0) return { outcome: "skipped" as const, reason: "monitor_replaced" };
 
       await logActivity(db, {
         companyId: claimed.companyId,
@@ -11926,15 +11964,15 @@ export function heartbeatService(
           await db
             .update(issues)
             .set({
-              ...buildIssueMonitorClearedPatch({
+              ...monitorOnlyDispatchPatch(buildIssueMonitorClearedPatch({
                 issue: claimed,
                 policy,
                 clearReason: "dispatch_skipped",
                 clearedAt: input.now,
-              }),
+              })),
               updatedAt: new Date(),
             })
-            .where(eq(issues.id, claimed.id));
+            .where(issueMonitorClaimCondition(claimed));
 
           await logActivity(db, {
             companyId: claimed.companyId,
@@ -11964,7 +12002,7 @@ export function heartbeatService(
             monitorWakeRequestedAt: null,
             updatedAt: new Date(),
           })
-          .where(eq(issues.id, claimed.id));
+          .where(issueMonitorClaimCondition(claimed));
       } else {
         await db
           .update(issues)
@@ -11972,11 +12010,19 @@ export function heartbeatService(
             monitorWakeRequestedAt: null,
             updatedAt: new Date(),
           })
-          .where(eq(issues.id, claimed.id));
+          .where(issueMonitorClaimCondition(claimed));
       }
 
       throw err;
     }
+  }
+
+  function noActiveNativeMonitorRun() {
+    return sql`not exists (select 1 from ${heartbeatRuns} monitor_run
+      where monitor_run.company_id = ${issues.companyId}
+        and monitor_run.native_issue_id = ${issues.id}
+        and monitor_run.runtime_mode = 'native'
+        and monitor_run.status in ('queued', 'running', 'scheduled_retry'))`;
   }
 
   async function triggerIssueMonitor(
@@ -12071,6 +12117,7 @@ export function heartbeatService(
       .where(
         and(
           eq(companies.status, "active"),
+          noActiveNativeMonitorRun(),
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
           isNull(issues.assigneeUserId),
@@ -12099,6 +12146,7 @@ export function heartbeatService(
           .where(
             and(
               eq(issues.id, due.id),
+              noActiveNativeMonitorRun(),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
               isNull(issues.assigneeUserId),
@@ -21753,7 +21801,7 @@ export function heartbeatService(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
 
-      const { resolvedConfig, secretKeys, secretManifest } =
+      const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
           managedAiCredentials: Boolean(aiBinding),
           managedGitHubCredentials: !useHostGitHub,
@@ -24950,6 +24998,7 @@ export function heartbeatService(
                     managedAiCredentialIdentity: managedAiRuntime?.identity,
                     managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
                     runnerEnvironment: {
+                      ...configuredEnvironmentProjection(configuredTaskEnvironment),
                       ...buildNativeProviderEnvironment(
                         adapterEnv,
                         process.env,
@@ -27839,6 +27888,9 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              monitorNextCheckAt: issues.monitorNextCheckAt,
+              monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -27861,6 +27913,54 @@ export function heartbeatService(
               triggerDetail,
               reason: "issue_execution_issue_not_found",
               payload,
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
+          const issueStateGuard = opts.issueStateGuard;
+          const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
+            : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
+              eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            )).limit(1).then(rows => rows[0] ?? null);
+          if (
+            issueStateGuard &&
+            (!issueStateGuard.statuses.includes(issue.status) ||
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
+              (issueStateGuard.monitorNextCheckAt !== undefined && (
+                activeMonitorRun !== null || issue.assigneeUserId !== null ||
+                issue.monitorNextCheckAt?.toISOString() !== issueStateGuard.monitorNextCheckAt ||
+                issue.monitorWakeRequestedAt?.toISOString() !== issueStateGuard.monitorWakeRequestedAt
+              )))
+          ) {
+            // A deferred monitor retains its schedule; do not create a receipt
+            // that could suppress its next admission attempt.
+            if (issueStateGuard.monitorNextCheckAt !== undefined) return { kind: "skipped" as const };
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_state_guard_mismatch",
+              payload: {
+                ...(payload ?? {}),
+                heartbeatSkip: {
+                  reason:
+                    "Issue status or assignee changed before the wake could be queued.",
+                  issueId: issue.id,
+                  expectedStatuses: issueStateGuard.statuses,
+                  actualStatus: issue.status,
+                  expectedAssigneeAgentId: issueStateGuard.assigneeAgentId,
+                  actualAssigneeAgentId: issue.assigneeAgentId,
+                },
+              },
               status: "skipped",
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
@@ -28068,40 +28168,6 @@ export function heartbeatService(
             onBlocked: (reason, message) => { continuationWait = { reason, message }; },
           }))) return deferBlockedExecution(executionBlocker);
 
-          const issueStateGuard = opts.issueStateGuard;
-          if (
-            issueStateGuard &&
-            (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
-              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
-          ) {
-            await tx.insert(agentWakeupRequests).values({
-              ...durableReceiptFields,
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason: "issue_state_guard_mismatch",
-              payload: {
-                ...(payload ?? {}),
-                heartbeatSkip: {
-                  reason:
-                    "Issue status or assignee changed before the wake could be queued.",
-                  issueId: issue.id,
-                  expectedStatuses: issueStateGuard.statuses,
-                  actualStatus: issue.status,
-                  expectedAssigneeAgentId: issueStateGuard.assigneeAgentId,
-                  actualAssigneeAgentId: issue.assigneeAgentId,
-                },
-              },
-              status: "skipped",
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-              finishedAt: new Date(),
-            });
-            return { kind: "skipped" as const };
-          }
 
           if (
             worktreeExecutionCutoff &&
