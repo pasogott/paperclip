@@ -33,6 +33,16 @@
         "server/src/services/heartbeat-*.ts",
         "server/src/__tests__/heartbeat-*.test.ts"
       ]
+    },
+    {
+      "path": "rules/database-migration-snapshots.mdc",
+      "description": "Snapshot retention requirements for migration generation, rebases, and review; preserve SQL migrations and journal history.",
+      "scope": [
+        "packages/db/src/schema/**",
+        "packages/db/src/migrations/**",
+        "packages/db/package.json",
+        "packages/db/drizzle.config.ts"
+      ]
     }
   ]
 }
