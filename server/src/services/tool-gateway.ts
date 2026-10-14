@@ -22,6 +22,7 @@ import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
   and,
   asc,
@@ -209,6 +210,7 @@ export function isConnectionGrantAudienceAllowed(
 // `tool_timeout` even though the approval succeeded. Give approved executions
 // the full permitted headroom instead.
 const APPROVED_EXECUTION_TIMEOUT_MS = 60_000;
+const GITHUB_BOT_TOOL_TIMEOUT_MS = 60_000;
 const ACTION_REQUEST_EXECUTION_POLL_MS = 25;
 // Approval execution performs live target, signature, managed-argument, and
 // issue-state checks before provider dispatch. Give that preparation a
@@ -351,6 +353,22 @@ export class ToolGatewayHttpError extends Error {
   ) {
     super(message);
   }
+}
+
+/** Repeated discovery rows are one tool; conflicting bindings stay ambiguous. */
+export function deduplicateToolDescriptors(tools: readonly ToolGatewayDescriptor[]): ToolGatewayDescriptor[] {
+  const unique = new Map<string, ToolGatewayDescriptor>();
+  for (const tool of tools) {
+    const previous = unique.get(tool.name);
+    if (previous) {
+      if (!isDeepStrictEqual(previous, tool)) {
+        throw new ToolGatewayHttpError(409, "Conflicting tool definitions share the same name.", "tool_name_collision");
+      }
+      continue;
+    }
+    unique.set(tool.name, tool);
+  }
+  return [...unique.values()];
 }
 
 interface ExecuteGatewayToolInput {
@@ -732,8 +750,10 @@ function gatewaySessionFromRow(
   };
 }
 
-function timeoutMs(value: number | undefined) {
-  if (!Number.isFinite(value)) return DEFAULT_TOOL_TIMEOUT_MS;
+function timeoutMs(value: number | undefined, tool?: ToolGatewayDescriptor) {
+  if (!Number.isFinite(value)) return tool?.providerType === "paperclip_github_chat"
+    ? GITHUB_BOT_TOOL_TIMEOUT_MS
+    : DEFAULT_TOOL_TIMEOUT_MS;
   return Math.max(
     1,
     Math.min(60_000, Math.floor(value ?? DEFAULT_TOOL_TIMEOUT_MS)),
@@ -3081,7 +3101,7 @@ export function createToolGatewayService(
         visibleTools.push(...VIRTUAL_TOOLS);
       }
     }
-    return visibleTools;
+    return deduplicateToolDescriptors(visibleTools);
   }
 
   async function executeBuiltinTool(
@@ -7270,7 +7290,7 @@ export function createToolGatewayService(
 
     const startedAt = Date.now();
     try {
-      const executionTimeoutMs = timeoutMs(args.timeoutMs);
+      const executionTimeoutMs = timeoutMs(args.timeoutMs, args.tool);
       const connectedMcpExecution =
         (args.tool.providerType === "mcp_remote_http" || args.tool.providerType === "provider_rest")
           ? await executeRemoteHttpTool(
@@ -9033,12 +9053,14 @@ export function createToolGatewayService(
           tool,
         }),
       );
-      return decisions
+      const visibleTools = decisions
         .filter(
           ({ decision }) =>
             decision.allowed || decision.decision === "require_approval",
         )
-        .map(({ tool }) => {
+        .map(({ tool }) => tool);
+      return deduplicateToolDescriptors(visibleTools)
+        .map((tool) => {
           const {
             providerType: _providerType,
             risk: _risk,
@@ -10624,7 +10646,7 @@ export function createToolGatewayService(
       });
 
       try {
-        const executionTimeoutMs = timeoutMs(input.timeoutMs);
+        const executionTimeoutMs = timeoutMs(input.timeoutMs, tool);
         if (
           tool.providerType === "paperclip_plugin" &&
           (!session.agentId || !session.runId)
