@@ -2,6 +2,51 @@
 
 Paperclip uses PostgreSQL via [Drizzle ORM](https://orm.drizzle.team/). There are three ways to run the database, from simplest to most production-ready.
 
+### Persistent case handoffs
+
+Standalone `cases` add a nullable unique `work_issue_id`, a descriptive `phase`,
+and an integer `handoff_version`. Historical passive records have no primary task;
+native `create_case` requires kickoff plus explicit workflow text and creates its primary task atomically. This is
+separate from `pipeline_cases`.
+
+First-task `initialDocuments` use ordinary `documents`, `document_revisions`
+and `issue_documents` in the case kickoff transaction. No case document copies,
+pending seeds or new tables are introduced. Case read surfaces join accessible
+linked task documents; historical `case_documents` records remain unchanged.
+Required `workflow_document_text` uses the same tables, under ordinary task key
+`workflow`. It is committed before delivery and contributes to the idempotency
+fingerprint. Existing cases and tasks receive no inferred workflow or backfill.
+Authoring guidance recommends both a Mermaid `stateDiagram-v2` map and prose
+defining each transition. Neither representation is parsed into database states.
+
+`case_handoffs` retains the task/agent identities, principal-scoped idempotency
+key and request fingerprint, observed/applied bigint task status revisions,
+instructions/comment, source run, and stable wakeup receipt. Partial unique
+indexes permit only one pending handoff per task and case. The pending-attempt
+index and expiring lease support bounded delivery across controller restarts.
+The ledger states distinguish release waiting, assignment applied but admission
+pending, queue acceptance, and cancellation. Provider execution remains in the
+ordinary heartbeat tables.
+
+`actor_context` retains a versioned, server-derived authorization context for
+delayed assignment. It contains no credentials and is omitted from public
+handoff responses. Applying a delayed transfer rechecks the original caller's
+current assignment permissions. Historical pending transfers without this
+context fail closed; an operator can cancel them and request a new handoff.
+
+Terminal handoffs have `destination_kind = 'done'`, a null destination agent,
+and states `awaiting_completion` / `completed` with `completed_at`. They share
+pending task/case uniqueness with agent transfers but do not enter the delivery
+lease index or wake queue. Accepted ordinary task completion and terminal case
+closure commit together. No terminal intent is inferred from a case's status.
+
+`case_access_sources` stores retained logical issue/project identities without
+deletion cascades from those sources. A missing source denies access. The case
+is readable only when every source's existing permissions allow it; unlinking a
+task or changing presentation metadata cannot widen that set. The case handoff
+migration backfills historical project and linked-task sources conservatively
+and leaves all existing cases passive. Source identities are not grants.
+
 ### Task query performance
 
 Run-context lookups use expression indexes for both `context_snapshot.issueId`
@@ -316,6 +361,13 @@ Attention counts use the same catalog projection and read only invocation IDs
 and connection IDs to associate pending requests. Summary queries also omit
 review titles and descriptions; the separate review query still returns them.
 
+Internal effective-tool assignment lookups use the same catalog projection.
+Run preparation, native runtime setup, and connection policy checks need tool
+IDs and names, not complete tool definitions. They still resolve current profile
+bindings, selectors, exclusions, and installed connections on every call. The
+public effective-profile response continues to include complete tool schemas
+and annotations.
+
 ## Execution identity row locks
 
 Identity initialization, credential acquisition, and steering reconciliation lock
@@ -400,13 +452,18 @@ keep the application fully active. A failed database check fails startup.
 
 An empty unclaimed application keeps its HTTP server and sandbox plugins ready,
 but skips recurring database work: chat/email delivery, plugin jobs, browser
-cleanup, feedback export, import cleanup, execution reconciliation, heartbeat
+cleanup, feedback export, import cleanup, execution reconciliation, Muse maintenance, heartbeat
 schedules, and automatic backups. Startup migrations, plugin installation, and
 other one-time preparation still run. Normal anonymous health probes return
 `warmStandby: true` without SQL or session lookups. This is application liveness,
 not a current database connectivity check. Other API requests and WebSocket upgrades return 503 until
 the signed claim succeeds. Page and asset requests serve only the static UI
 router, bypassing session, bearer-key, tenant, and other dynamic handlers.
+
+Muse defers its startup qualification-evidence update and recurring database
+sweeps until standby ends. The first enabled sweep marks interrupted evidence
+before it reconciles qualification deadlines or terminal assignments. Claimed
+workspaces retain ordinary Muse maintenance even when idle task drain is active.
 
 The existing signed claim on `GET /api/health` writes the identity durably before
 normal requests and polling resume. No polling discovers claims and no process
@@ -1054,3 +1111,13 @@ and migration history remain so existing records, documents, and links are prese
 and future schema generation does not drop them. No removal migration or data
 cleanup runs. These tables remain part of normal database backups; the separate
 Cases feature is unaffected.
+
+### Prompt injection classification
+
+`company_prompt_injection_prevention` stores optional shared connection/model
+preferences without backfilling existing companies. `prompt_injection_invocations`
+stores content-free classification verdicts, provider receipts and archival
+identity references. Budget reservations have a distinct classifier invocation
+source, and cost events accept `prompt_injection`. Unknown charges retain their
+holds through agent deletion attempts and settle through billing correction.
+See [service behavior](prompt-injection-prevention.md).
