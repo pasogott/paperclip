@@ -9171,15 +9171,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const [source] = await db.insert(projectWorkspaces).values({ companyId: fixture.companyId, projectId: project.id,
       name: "Source", cwd: `/tmp/chat-source-${fixture.companyId}` }).returning();
     const defaults = { workspace: { kind: "configured_source" as const, projectWorkspaceId: source.id, mode: "shared" as const } };
-    await expect(service.update(endpoint.id, { executionDefaults: defaults }, "owner-user")).rejects.toMatchObject({ status: 403 });
-    await db.insert(companyMemberships).values({ companyId: fixture.companyId, principalType: "agent",
-      principalId: fixture.assignedAgentId, status: "active", membershipRole: "member" });
-    await db.insert(principalPermissionGrants).values([
-      { companyId: fixture.companyId, principalType: "user", principalId: "owner-user", permissionKey: "tasks:assign_scope",
-        scope: { projectId: project.id, assigneeAgentId: fixture.assignedAgentId } },
-      { companyId: fixture.companyId, principalType: "agent", principalId: fixture.assignedAgentId, permissionKey: "tasks:assign_scope",
-        scope: { projectId: project.id, assigneeAgentId: fixture.assignedAgentId } },
-    ]);
+    // Selecting readable workspace configuration does not assign the task to its source project
+    // or require filesystem-write grants from that project.
     await service.update(endpoint.id, { executionDefaults: defaults }, "owner-user");
     const thread = makeThread({ channelId: "C-PROTECTED", id: "slack:C-PROTECTED:8300.1", name: "protected" });
     await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread,
