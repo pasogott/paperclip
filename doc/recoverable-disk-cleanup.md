@@ -100,6 +100,15 @@ closed issue's worktree only when its remote can reproduce it exactly. With
 `PAPERCLIP_GIT_RESTORE_POINTS_ENABLED=true`, it can also remove a worktree that has
 unpushed commits, uncommitted or untracked files, or history-only commits, once its issue
 tree has been closed for `PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS` (default `3`).
+It also removes the worktree of an issue tree that is still open once nothing has
+touched it for `PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS` (default `7`, `0` turns this off):
+no issue in the tree or bound to the workspace was updated and no run for those issues or
+the workspace was created, started or finished in that time, and no run is still live. An
+interrupted removal is finished by later sweeps while the issue stays open. The workspace reaper sets a
+deadline for that moment, so open trees cost no recurring checks before then. When a run
+later finds its issue's workspace removed this way, it reopens the workspace, restore
+point included, before using it; if the restore fails, the run fails instead of starting
+in a new workspace. A comment or an agent update on the issue reopens it the same way.
 Before removal it saves a restore point:
 
 - a git bundle of commits the remote does not have, against a remote-verified base,
@@ -140,8 +149,16 @@ result. The bundle is always imported, so history-only commits are present again
 objects in the repository; they are not recreated as branches or reflog entries, and the
 restore point keeps them until it expires. A draft commit message left by an aborted
 commit still keeps the worktree from expiring, because restore points do not save it. A worktree that already matches is only marked applied, and a worktree that
-diverged is never overwritten: the restore fails closed and can be retried. A missing,
-corrupt or expired restore point also fails closed.
+diverged is never overwritten: the restore fails closed and can be retried. A missing
+or corrupt restore point also fails closed.
+
+When a restore point has expired, through retention or on a nested checkout, reopening
+starts fresh instead: the worktree is recreated on its branch (the branch tip if the
+repository still has it, otherwise a new branch from the base ref), the project's nested
+repositories are cloned fresh before the provision command runs, the saved recipe is
+dropped, and a system comment on the issue warns that unpushed and uncommitted work from
+before the cleanup is no longer available. The same warning is returned with the reopen
+result and recorded on the `execution_workspace.reopened` activity.
 
 
 Restore points are encrypted saves of the parts of a git worktree that its remote
