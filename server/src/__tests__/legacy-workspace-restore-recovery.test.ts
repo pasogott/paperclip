@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createDatabaseResponseCapture, installDatabaseResponseCapture } from "@paperclipai/db/response-capture";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueRecoveryActions, issues, projects } from "@paperclipai/db";
@@ -45,6 +46,67 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
     workspaceRestoreFailure: "restore_failed", conversationContinuation: "continue_conversation_v1",
   } };
   const readLease = async (id: string) => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, id)))[0];
+
+  it("locks only terminal control state while returning and retaining the complete run", async () => {
+    const f = await seed();
+    const bulk = randomBytes(128 * 1024).toString("base64");
+    const [saved] = await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.run.contextSnapshot, savedInput: bulk },
+      runnerProfileJson: { savedProfile: bulk }, stdoutExcerpt: bulk, stderrExcerpt: bulk,
+    }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    const events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(db, { heartbeatRuns }, capture);
+    let returned: Awaited<ReturnType<typeof terminalizeLegacyExecution>>;
+    try { returned = await terminalizeLegacyExecution({ db, run: saved!, status: "failed", patch }); }
+    finally { capture.flush(); }
+    const groups = events.filter(event => event.event === "paperclip.db_response_capture.entry.v1");
+    const reads = groups.filter(group => group.table === "heartbeat_runs" && group.operation === "select");
+    expect(reads.reduce((sum, group) => sum + Number(group.calls), 0)).toBe(1);
+    expect(reads.reduce((sum, group) => sum + Number(group.responseValueBytes), 0)).toBeLessThan(4096);
+    expect(returned).toMatchObject({ id: f.runId, status: "failed", contextSnapshot: saved!.contextSnapshot,
+      runnerProfileJson: saved!.runnerProfileJson, stdoutExcerpt: bulk, stderrExcerpt: bulk });
+    expect(hasRequiredWorkspaceRecovery(returned!.resultJson)).toBe(true);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(returned);
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+      .toEqual([expect.objectContaining({ evidence: expect.objectContaining({ runId: f.runId }), ownerType: "board" })]);
+    expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
+  });
+
+  it.each(["legacy", "native"])("returns one complete run when retained workspace evidence is unchanged for %s", async (runtimeMode) => {
+    const f = await seed();
+    const bulk = randomBytes(128 * 1024).toString("base64");
+    const [saved] = await db.update(heartbeatRuns).set({ runtimeMode, status: "failed", finishedAt: new Date(),
+      contextSnapshot: { ...f.run.contextSnapshot, savedInput: bulk }, runnerProfileJson: { savedProfile: bulk },
+      stdoutExcerpt: bulk, stderrExcerpt: bulk,
+    }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    const recordRestoreFailureOnly = runtimeMode === "native";
+    const failed = (await terminalizeLegacyExecution({ db, run: saved!, status: "failed", recordRestoreFailureOnly,
+      workspaceRestoreSource: f.lease,
+      patch: { resultJson: { workspaceRestoreFailure: "restore_failed", futureResult: bulk } },
+    }))!;
+    const events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(db, { heartbeatRuns }, capture);
+    let returned: Awaited<ReturnType<typeof terminalizeLegacyExecution>>;
+    try { returned = await terminalizeLegacyExecution({ db, run: failed, status: "failed", recordRestoreFailureOnly,
+      workspaceRestoreSource: f.lease,
+      ...(recordRestoreFailureOnly ? { patch: { resultJson: failed.resultJson } } : {}),
+    }); }
+    finally { capture.flush(); }
+    const writes = events.filter(event => event.event === "paperclip.db_response_capture.entry.v1"
+      && event.table === "heartbeat_runs" && event.operation === "update");
+    expect(writes.reduce((sum, group) => sum + Number(group.rows), 0)).toBe(1);
+    expect(returned).toMatchObject({ id: f.runId, status: "failed", finishedAt: failed.finishedAt,
+      contextSnapshot: failed.contextSnapshot, runnerProfileJson: failed.runnerProfileJson, resultJson: failed.resultJson,
+      stdoutExcerpt: bulk, stderrExcerpt: bulk });
+    if (!recordRestoreFailureOnly) expect(returned!.executionStatusDeliveryId).toBe(failed.executionStatusDeliveryId);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(returned);
+    expect(await readLease(f.lease.id)).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+      .toEqual([expect.objectContaining({ evidence: expect.objectContaining({ runId: f.runId }), ownerType: "board" })]);
+    expect(JSON.stringify(events)).not.toContain(bulk.slice(0, 64));
+  });
 
   it("preserves pending and acknowledged status delivery on unpatched legacy recovery retries", async () => {
     await deliverExecutionStatuses(db, { publish: vi.fn() });

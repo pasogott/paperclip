@@ -4,7 +4,7 @@ import { reconcileMuseNativeTerminalRun } from "./muse-terminal-reconciliation.j
 import { assertNativeCaseHandoffResult } from "./native-case-handoff.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
 import { hasPublishedGitHubReview } from "../chat-channels/github/review-wait.js";
-import { readNativeMonitorDelivery } from "./native-monitor-delivery.js";
+import { readNativeMonitorDelivery, readNativePreservedMonitorWait } from "./native-monitor-delivery.js";
 import { isNativePlanWaitResult, readNativePlanWait } from "./native-plan-wait.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
@@ -1331,10 +1331,16 @@ export async function finalizeNativeRun(input: {
           })
         : "not_applicable";
     const monitorWaitAt = scheduledIssueMonitorWait(authoritativeIssue, run.agentId);
+    const preservedMonitorWait = terminalState === "succeeded" && input.workspaceFinalizeStatus === "succeeded" &&
+      assessment.reportedDisposition === "yielded" && assessment.continuation?.kind === "monitor"
+      ? await readNativePreservedMonitorWait(input.db, {
+        companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId,
+      }, authoritativeIssue) : null;
+    if (preservedMonitorWait && preservedMonitorWait.resultId !== resultRow.id) throw new NativeStatusRaceError();
     const supersededReviews = terminalState === "succeeded" && input.workspaceFinalizeStatus === "succeeded" &&
       assessment.attentionRequests.length === 0 && (assessment.reportedDisposition === "done" ||
         (assessment.reportedDisposition === "yielded" && (externalChatResponseWaitAuthorization === "authorized" ||
-          (assessment.continuation?.kind === "monitor" && monitorWaitAt !== null))))
+          (assessment.continuation?.kind === "monitor" && monitorWaitAt !== null && !preservedMonitorWait))))
       ? await findSupersededExternalReviewRequests(input.db, {
         companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId,
       }) : [];
@@ -1419,6 +1425,7 @@ export async function finalizeNativeRun(input: {
     const proposedDecision = resolveNativeFinalizerStatus({
       caseHandoffAuthorized: Boolean(await assertNativeCaseHandoffResult(input.db, run.id, authoritativeIssue.id, result)),
       monitorWaitDispatched: monitorDelivery !== null,
+      monitorWaitPreserved: preservedMonitorWait !== null,
       monitorWaitAuthorized: authoritativeIssue.workMode === "standard" && authoritativeIssue.executionRunId === run.id && monitorWaitAt !== null,
       planWaitAuthorized: planWait !== null,
       hasPendingChildCompletion,
@@ -1522,6 +1529,8 @@ export async function finalizeNativeRun(input: {
           ? { agentId: run.agentId, nextCheckAt: monitorWaitAt } : undefined,
         requireMonitorDelivery: decision.reasonCode === "scheduled_monitor_dispatched"
           ? monitorDelivery ?? undefined : undefined,
+        requirePreservedMonitorWait: decision.reasonCode === "scheduled_monitor_preserved"
+          ? preservedMonitorWait ?? undefined : undefined,
         requirePlanWaitSource:
           decision.reasonCode === "native_plan_accepted_waiting_for_continuation"
             ? planWait?.source : undefined,

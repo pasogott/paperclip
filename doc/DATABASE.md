@@ -49,6 +49,15 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+The attention feed checks for newer runs with company-scoped existence probes.
+The probes match the failed run's agent and issue or task context. They preserve
+the existing millisecond comparison and empty-context rules. Each batch holds
+at most 1,000 failed runs. Retained run history stays in the database; this check
+returns only the identifiers of failures that have a newer matching run.
+For failures without a task key, it reads the latest keyless timestamp once per
+agent. Unique agents are batched separately, so repeated failures do not repeat
+the same history scan. Both paths retain the current millisecond comparison.
+
 The issue-lock adapter's release read omits `result_json.stdout` and
 `result_json.stderr` before transferring a run to the controller. Native context
 also omits saved launch text, execution-continuation bodies, workspace and
@@ -65,6 +74,13 @@ remain in the stored run and its full detail reads. These queries also return
 the PostgreSQL row version. Native blocked-wait repair compares that version
 against a fresh full source read before applying changes. Any intervening row
 update, including an edit outside the projection, defers repair to a fresh sweep.
+
+The two preliminary reconciliation reads omit named launch renderings and
+preparation payloads. Native profiles omit unused native execution input.
+They retain all other context, full results, legacy profiles, task identity,
+retry accounting, and unknown controls. Native runs still reach their native
+recovery guard. Terminalization locks its current control state and returns
+full rows from its writes. Stored input remains intact.
 
 Execution-blocker reads select process, lifecycle, and task-binding fields rather
 than full execution rows. Context retains typed task and pre-dispatch evidence;
@@ -89,6 +105,11 @@ identity, and checkpoint presence without loading the checkpoint or execution
 payloads. It retains current coordinator checks, provider evidence, local-host
 identity checks, and every lease's termination receipt. The stop receipt and
 process-field update remain in the same transaction.
+
+Legacy terminalization locks runtime mode, status, full result evidence, and the
+status-delivery token without loading unused input, profile, or log bodies.
+It keeps the existing lock, full returned run, workspace-retention
+receipts, and source-bound recovery holds. Stored payloads remain unchanged.
 
 Conversation ownership checks select process identity and full recovery result
 evidence without execution prompts or profiles. Committed native reply repair
@@ -172,6 +193,13 @@ request settles. Connection readiness also reconciles the displayed run
 queries after any older request. Follow-up reads belong to the current mounted
 scope and stop when it changes or unmounts. The first open and reconnect still
 reconcile missed events.
+
+Bundled skill release checks read the current stored version ID and a SHA-256
+fingerprint of its file inventory. A per-database memo keeps at most 64 verified
+snapshots. It reuses a verification only when the current database fingerprint
+and current on-disk inventory hash both match. A changed or missing snapshot
+still follows full validation or seeding. Company access and local source
+reconciliation still run for each request; authorization is not cached.
 
 Connection-assignment checks select profile bindings for the current company or
 agent and read rules that can match the selected connection's catalog rows.
@@ -269,6 +297,9 @@ Legacy recovery also retains the pending delivery when status is unchanged and
 no patch was supplied. Explicit patches, new terminal statuses, and newly
 retained workspace evidence still create a delivery. File retention, ownership
 checks, failed write conditions, lock cleanup, and recovery holds still apply.
+The retention-evidence write returns another full run only when that evidence
+changes. An unchanged retry keeps the full run returned by the first write and
+still processes retained leases and recovery holds.
 
 Agent lists read the complete company roster once and use that same snapshot for
 termination filtering and organization-chain normalization. Detail and plugin runtime reads
