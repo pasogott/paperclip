@@ -812,6 +812,7 @@ export function heartbeatService(
     resolveSessionBeforeForWakeup,
     getRun,
     getRunCleanupState,
+    getRunExecutionWait,
     getRunWorkspaceSettlement,
     getRunStatus,
     ensureRuntimeState,
@@ -1393,6 +1394,7 @@ export function heartbeatService(
   const runControl = createHeartbeatRunControl(db, {
     getRun,
     getRunCleanupState,
+    getRunExecutionWait,
     options,
     envOrchestrator,
     activeRunExecutions,

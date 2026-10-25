@@ -20,6 +20,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { createDatabaseResponseCapture, installDatabaseResponseCapture } from "@paperclipai/db/response-capture";
 import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity } from "../run-identity.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
@@ -196,6 +197,87 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: {},
       }),
     ).rejects.toThrow("paperclip_runner_tool_not_advertised");
+  });
+
+  it("reads current tool authority without transferring saved profiles or output", async () => {
+    const binding = { companyId, agentId, issueId, runId };
+    const authority = new PaperclipRunnerToolAuthority(db, binding);
+    const contextCall = { tool: "get_task_context", callId: "context-read-width", arguments: {} };
+    const apiCall = { tool: "search_api", callId: "api-read-width", arguments: { query: "read task" } };
+    const expectedContext = await authority.execute(contextCall);
+    const expectedApi = await authority.execute(apiCall);
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [actor] = await db.select({ status: agents.status }).from(agents).where(eq(agents.id, agentId));
+    const payload = "saved-profile-and-output🙂".repeat(32_768);
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { ...original.runnerProfileJson, retainedPayload: payload },
+      stdoutExcerpt: payload,
+      stderrExcerpt: payload,
+    }).where(eq(heartbeatRuns.id, runId));
+    const [expanded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const observed = createDb(temporary!.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(observed, { heartbeatRuns, issues, agents, companies }, capture);
+    try {
+      const reader = new PaperclipRunnerToolAuthority(observed, binding);
+      const context = await reader.execute(contextCall), api = await reader.execute(apiCall);
+      expect(context).toEqual(expectedContext);
+      expect(api).toEqual(expectedApi);
+      expect(JSON.stringify([context, api])).not.toContain("saved-profile-and-output");
+      capture.flush();
+      const reads = events.filter(event => event.table === "heartbeat_runs" && event.operation === "select");
+      expect(reads.length).toBeGreaterThan(0);
+      expect(reads.reduce((bytes, event) => bytes + Number(event.responseValueBytes), 0)).toBeLessThan(16 * 1024);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(expanded);
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      await expect(reader.execute(contextCall)).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
+      await expect(reader.execute(apiCall)).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
+    } finally {
+      capture.flush();
+      await observed.$client.end();
+      await db.update(agents).set({ status: actor.status }).where(eq(agents.id, agentId));
+      await db.update(heartbeatRuns).set({
+        runnerProfileJson: original.runnerProfileJson,
+        stdoutExcerpt: original.stdoutExcerpt,
+        stderrExcerpt: original.stderrExcerpt,
+      }).where(eq(heartbeatRuns.id, runId));
+    }
+  });
+
+  it("reads tool authority without transferring unused launch renderings", async () => {
+    const binding = { companyId, agentId, issueId, runId };
+    const authority = new PaperclipRunnerToolAuthority(db, binding);
+    const contextCall = { tool: "get_task_context", callId: "launch-context-read", arguments: {} };
+    const apiCall = { tool: "search_api", callId: "launch-api-read", arguments: { query: "read task" } };
+    const expectedContext = await authority.execute(contextCall), expectedApi = await authority.execute(apiCall);
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const payload = "retained-launch-rendering🙂".repeat(8192);
+    const context = { ...original.contextSnapshot, executionContinuation: { savedInput: payload }, paperclipTaskMarkdown: payload,
+      paperclipTaskMarkdownCompact: payload, paperclipTaskMarkdownAssignment: payload, paperclipTaskMarkdownAssignmentCompact: payload,
+      paperclipWorkspace: { savedInput: payload }, paperclipEnvironment: { savedInput: payload },
+      paperclipContinuationSummary: payload, paperclipWakeComment: payload };
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, runId));
+    const [expanded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const observed = createDb(temporary!.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(observed, { heartbeatRuns, issues, agents, companies }, capture);
+    try {
+      const reader = new PaperclipRunnerToolAuthority(observed, binding);
+      const actualContext = await reader.execute(contextCall), actualApi = await reader.execute(apiCall);
+      capture.flush();
+      const reads = events.filter(event => event.table === "heartbeat_runs" && event.operation === "select");
+      expect(reads.length).toBeGreaterThan(0);
+      expect(reads.reduce((bytes, event) => bytes + Number(event.responseValueBytes), 0)).toBeLessThan(16 * 1024);
+      expect(actualContext).toEqual(expectedContext);
+      expect(actualApi).toEqual(expectedApi);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(expanded);
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, runId));
+      await expect(reader.execute(contextCall)).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
+      await expect(reader.execute(apiCall)).rejects.toThrow("paperclip_runner_tool_binding_not_authorized");
+    } finally {
+      capture.flush(); await observed.$client.end();
+      await db.update(heartbeatRuns).set({ contextSnapshot: original.contextSnapshot, status: original.status }).where(eq(heartbeatRuns.id, runId));
+    }
   });
 
   it("preserves platform receipt provenance in both mixed task history readers", async () => {
