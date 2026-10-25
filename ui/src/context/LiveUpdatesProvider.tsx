@@ -1791,14 +1791,14 @@ function handleLiveEvent(
     event.createdAt,
     event.type,
   );
-  if (liveStatusPatch) {
-    applyRunLiveStatusPatchToCaches(
-      queryClient,
-      expectedCompanyId,
-      pathname,
-      liveStatusPatch,
-    );
-  }
+  const liveStatusPatched = liveStatusPatch
+    ? applyRunLiveStatusPatchToCaches(
+        queryClient,
+        expectedCompanyId,
+        pathname,
+        liveStatusPatch,
+      )
+    : false;
   if (event.type === "heartbeat.run.log") {
     return;
   }
@@ -1831,7 +1831,7 @@ function handleLiveEvent(
 
   if (event.type === "heartbeat.run.progress") {
     invalidateHeartbeatProgressQueries(queryClient, expectedCompanyId, payload);
-    invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
+    if (!liveStatusPatched) invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
     return;
   }
 
@@ -1942,6 +1942,7 @@ export const __liveUpdatesTestUtils = {
   buildRunStatusToast,
   closeSocketQuietly,
   dispatchLiveEventToSubscribers,
+  handleLiveEvent,
   LiveEventSubscriptionContext,
   applyRunLiveStatusPatchToCaches,
   hydrateVisibleIssueComment,

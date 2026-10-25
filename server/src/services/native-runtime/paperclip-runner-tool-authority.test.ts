@@ -1,4 +1,4 @@
-import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
+import * as connectorRuntime from "../connector-runtime.js";
 import * as cloudIdentity from "../cloud-runtime-identity.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -101,7 +101,7 @@ describe("PaperclipRunnerToolAuthority", () => {
   });
 
   it("registers pinned connector definitions without discovery and rejects revoked assignments at use", async () => {
-    const connectorAssignments = connectorToolDefinitionsForSkills(new Set([
+    const connectorAssignments = connectorRuntime.connectorToolDefinitionsForSkills(new Set([
       "paperclipai/paperclip/slack", "paperclipai/paperclip/browser-use-cloud", "custom/agentmail",
     ]));
     expect(connectorAssignments).toHaveLength(1);
@@ -244,7 +244,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
-  it("reads tool authority without transferring unused launch renderings", async () => {
+  it("reads tool authority without transferring unused launch renderings or wake payloads", async () => {
     const binding = { companyId, agentId, issueId, runId };
     const authority = new PaperclipRunnerToolAuthority(db, binding);
     const contextCall = { tool: "get_task_context", callId: "launch-context-read", arguments: {} };
@@ -255,7 +255,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     const context = { ...original.contextSnapshot, executionContinuation: { savedInput: payload }, paperclipTaskMarkdown: payload,
       paperclipTaskMarkdownCompact: payload, paperclipTaskMarkdownAssignment: payload, paperclipTaskMarkdownAssignmentCompact: payload,
       paperclipWorkspace: { savedInput: payload }, paperclipEnvironment: { savedInput: payload },
-      paperclipContinuationSummary: payload, paperclipWakeComment: payload };
+      paperclipContinuationSummary: payload, paperclipWakeComment: payload, paperclipWake: { retainedPayload: payload } };
     await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, runId));
     const [expanded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const observed = createDb(temporary!.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
@@ -277,6 +277,45 @@ describe("PaperclipRunnerToolAuthority", () => {
     } finally {
       capture.flush(); await observed.$client.end();
       await db.update(heartbeatRuns).set({ contextSnapshot: original.contextSnapshot, status: original.status }).where(eq(heartbeatRuns.id, runId));
+    }
+  });
+
+  it("checks the current full wake before mail actions while ordinary tools omit its payload", async () => {
+    const connectorAssignments = connectorRuntime.connectorToolDefinitionsForSkills(new Set(["paperclipai/paperclip/agentmail"]));
+    const name = connectorAssignments.flatMap(assignment => assignment.tools).find(tool => tool.name.startsWith("agentmail_"))!.name;
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId, connectorAssignments });
+    const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const dispatch = vi.spyOn(connectorRuntime, "executeConnectorTool").mockResolvedValue({ outcome: "mail-dispatched" });
+    const wake = {
+      reason: "External chat message received", externalChatProvider: "github", checkedOutByHarness: true,
+      issue: { id: issueId, identifier: "RNT-1", title: "Conversation", description: "Task", descriptionTruncated: false,
+        status: "in_progress", workMode: "standard" },
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 }, commentIds: ["wake-comment"],
+      latestCommentId: "wake-comment", comments: [{ id: "wake-comment", issueId, body: "Reply here", bodyTruncated: false, authorType: "user" }],
+      fallbackFetchNeeded: false,
+    };
+    const call = { tool: name, callId: "current-mail-wake", arguments: {} };
+    try {
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, paperclipWake: wake } }).where(eq(heartbeatRuns.id, runId));
+      await expect(authority.execute(call)).rejects.toThrow("Restricted chat runs cannot use email actions");
+      expect(dispatch).not.toHaveBeenCalled();
+      await expect(authority.execute({ tool: "get_task_context", callId: "chat-task-context", arguments: {} }))
+        .resolves.toMatchObject({ activeTask: { id: issueId } });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, runId));
+      await expect(authority.execute(call)).resolves.toEqual({ outcome: "mail-dispatched" });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, paperclipWake: { ...wake, checkedOutByHarness: false,
+        externalChatExecutionBound: true, issue: { ...wake.issue, status: "in_review" } } } }).where(eq(heartbeatRuns.id, runId));
+      await expect(authority.execute(call)).rejects.toThrow("Restricted chat runs cannot use email actions");
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      for (const context of [{ issueId, source: "chat:github" }, { issueId, paperclipExternalChatQuestionResponse: true }]) {
+        await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, runId));
+        await expect(authority.execute(call)).rejects.toThrow("Restricted chat runs cannot use email actions");
+        expect(dispatch).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      dispatch.mockRestore();
+      await db.update(heartbeatRuns).set({ contextSnapshot: original.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
     }
   });
 

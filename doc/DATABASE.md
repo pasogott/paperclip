@@ -129,14 +129,21 @@ stay in storage and are omitted from that read. Task and agent binding, current
 status, budget, and task privacy checks retain their existing predicates.
 Mutation transactions still lock and read complete run records. The unlocked
 authority read also omits named launch renderings and preparation data that its
-tools do not consume. Full wake payloads, other context, and result receipts
-remain available; the complete saved context stays in storage for execution.
+tools do not consume. Ordinary tool checks also omit the wake payload. Mail
+checks load the current full wake to enforce external-chat restrictions. Other
+context and result receipts remain available. The complete saved context stays
+in storage for execution.
 
 WebSocket delivery uses one fresh authorization batch for an event's task and
 run bindings. When both bindings name the same task, the batch reads its current
 authority once. Different task bindings must both pass. The batch is discarded
 after that delivery; later events still recheck grants, membership, task
 existence, and company boundaries.
+
+Browser progress events update cached live run status directly. A successful
+patch does not refetch task details, activity, or run history. Unknown runs
+retain the existing refresh fallback. Run transitions, activity events, and
+reconnect recovery still refresh their affected data.
 
 Connection-assignment checks select profile bindings for the current company or
 agent and read rules that can match the selected connection's catalog rows.
@@ -154,6 +161,11 @@ Saved-message execution-wait scans read current run state, process ownership,
 startup and cancellation receipts, task binding, and the recorded adapter kind.
 Saved profiles, output excerpts, and unrelated launch context stay in storage.
 Continuation admission and its locked mutation reads retain their existing gates.
+
+Task creation provenance reads current run identity, scope, and task binding.
+Legacy task references retain their typed values and existing precedence. Saved
+profiles, output, and unrelated context stay in storage. Viewer access to the
+source task and run is still checked before provenance is returned.
 
 The initial agent JWT run lookup reads only the cancellation state and
 conversation flag from saved run JSON. It does not transfer the full context or
