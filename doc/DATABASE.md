@@ -50,10 +50,14 @@ and leaves all existing cases passive. Source identities are not grants.
 ### Task query performance
 
 The issue-lock adapter's release read omits `result_json.stdout` and
-`result_json.stderr` before transferring a run to the controller. Every other result key, context field, and
-stop, retry, lease, and workspace-recovery check stays intact. Full output remains
-stored for execution history and detail reads. Terminal telemetry loads only its
-run identity, timestamps, usage, and typed task identifier.
+`result_json.stderr` before transferring a run to the controller. Native context
+also omits saved launch text, execution-continuation bodies, workspace and
+environment payloads, and the launch wake envelope. Task identity, retry and
+continuation controls, interaction and comment references, execution policy, unknown context fields, and every other
+result key stay intact. Legacy reads retain full context. Stop, retry, lease,
+and workspace-recovery checks do not change. Full inputs and output remain stored
+for execution history and detail reads. Terminal telemetry loads only its run
+identity, timestamps, usage, and typed task identifier.
 
 Recovery's latest-run queries return the context fields used by recovery
 decisions. Prompts, execution continuation bodies, and workspace setup payloads
@@ -64,9 +68,12 @@ update, including an edit outside the projection, defers repair to a fresh sweep
 
 Execution-blocker reads select process, lifecycle, and task-binding fields rather
 than full execution rows. Context retains typed task and pre-dispatch evidence;
-Runner profiles retain the adapter type and complete native execution input and
-workspace-sync receipts. Full result evidence stays available to the existing
-retry and workspace checks. Stored context, profiles, and output are unchanged.
+Runner profiles retain the adapter type, native input schema, binding, provider,
+workspace-access evidence, and complete workspace-sync receipts. Native task and
+runtime prompt payloads are not needed for these checks. Missing fields and
+malformed input values retain their original shape. Full result evidence stays
+available to the existing retry and workspace checks. Stored context, profiles,
+and output are unchanged.
 
 Committed native finalization reads run identity and ownership state before it
 claims the coordinator. It loads complete saved input only when finalization
@@ -76,6 +83,12 @@ status and ownership metadata; cancelled native workspace retention and legacy
 Stop settlement still load complete run evidence. Workspace settlement reads the
 saved sync descriptor, export retry, and first-heartbeat flag. These projections
 leave stored prompts, logs, results, and recovery state unchanged.
+
+Settled native process release locks run identity, terminal state, process
+identity, and checkpoint presence without loading the checkpoint or execution
+payloads. It retains current coordinator checks, provider evidence, local-host
+identity checks, and every lease's termination receipt. The stop receipt and
+process-field update remain in the same transaction.
 
 Conversation ownership checks select process identity and full recovery result
 evidence without execution prompts or profiles. Committed native reply repair
