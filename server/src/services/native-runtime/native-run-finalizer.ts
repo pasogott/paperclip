@@ -1608,33 +1608,42 @@ export async function finalizeNativeRun(input: {
         statusVersionAfter: Number(committed.issue.statusVersion),
         workspaceFinalizeStatus: input.workspaceFinalizeStatus,
       };
+      const projectedStatus = terminalState === "succeeded" ? "succeeded" as const
+        : terminalState === "cancelled" ? "cancelled" as const : "failed" as const;
+      const projectedResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
+        || ${JSON.stringify(finalizationMetadata)}::jsonb
+        || ${clearExecutionFailure ? recoveredExecutionFailureMetadata() : sql`'{}'::jsonb`}`;
+      const projectedError = providerFailure ? sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`
+        : clearExecutionFailure ? sql`null` : heartbeatRuns.error;
+      const projectedErrorCode = providerFailure ? sql`coalesce(${heartbeatRuns.errorCode}, ${providerFailure.errorCode})`
+        : clearExecutionFailure ? sql`null` : heartbeatRuns.errorCode;
+      const projectionChanged = or(
+        sql`${heartbeatRuns.nativePhase} is distinct from ${finalizationPhase}`,
+        sql`${heartbeatRuns.resultJson} is distinct from ${projectedResult}`,
+        sql`${heartbeatRuns.error} is distinct from ${projectedError}`,
+        sql`${heartbeatRuns.errorCode} is distinct from ${projectedErrorCode}`,
+        ...(input.projectRunStatus ? [
+          sql`${heartbeatRuns.status} is distinct from ${projectedStatus}`,
+          isNull(heartbeatRuns.finishedAt),
+        ] : []),
+      );
       const projectRun = (tx: Db) => tx
         .update(heartbeatRuns)
         .set({
-          executionStatusDeliveryId: randomUUID(),
+          executionStatusDeliveryId: sql`case when ${projectionChanged}
+            then ${randomUUID()}::uuid else ${heartbeatRuns.executionStatusDeliveryId} end`,
           ...(input.projectRunStatus
             ? {
-                status:
-                  terminalState === "succeeded"
-                    ? "succeeded"
-                    : terminalState === "cancelled"
-                      ? "cancelled"
-                      : "failed",
-                finishedAt: now,
+                status: projectedStatus,
+                finishedAt: sql`case when ${heartbeatRuns.status} is distinct from ${projectedStatus}
+                  then ${now.toISOString()}::timestamptz else coalesce(${heartbeatRuns.finishedAt}, ${now.toISOString()}::timestamptz) end`,
               }
             : {}),
           nativePhase: finalizationPhase,
           nativePhaseUpdatedAt: now,
           ...(clearExecutionFailure ? { error: null, errorCode: null } : {}),
-          ...(providerFailure ? {
-            // Recovery can finalize before heartbeat saves the adapter result.
-            // Retain any independently recorded execution/cleanup failure.
-            error: sql`coalesce(${heartbeatRuns.error}, ${providerFailure.errorMessage})`,
-            errorCode: sql`coalesce(${heartbeatRuns.errorCode}, ${providerFailure.errorCode})`,
-          } : {}),
-          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
-            || ${JSON.stringify(finalizationMetadata)}::jsonb
-            || ${clearExecutionFailure ? recoveredExecutionFailureMetadata() : sql`'{}'::jsonb`}`,
+          ...(providerFailure ? { error: projectedError, errorCode: projectedErrorCode } : {}),
+          resultJson: projectedResult,
           updatedAt: now,
         })
         .where(eq(heartbeatRuns.id, run.id))

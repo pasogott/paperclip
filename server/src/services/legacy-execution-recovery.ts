@@ -115,7 +115,8 @@ export async function terminalizeLegacyExecution(input: {
       .set({
         status: input.recordRestoreFailureOnly ? current.status : status,
         ...patch,
-        executionStatusDeliveryId: randomUUID(),
+        executionStatusDeliveryId: input.recordRestoreFailureOnly || current.status !== status || Object.keys(patch ?? {}).length > 0
+          ? randomUUID() : current.executionStatusDeliveryId,
         updatedAt: new Date(),
       })
       .where(
@@ -131,10 +132,15 @@ export async function terminalizeLegacyExecution(input: {
     const retainedLeaseIds = await preserveLegacyWorkspaceRestoreSources(tx as unknown as Db,
       input.recordRestoreFailureOnly ? { ...updated, status: "failed" } : updated, input.workspaceRestoreSource);
     if (retainedLeaseIds.length) {
-      [updated] = await tx.update(heartbeatRuns).set({ resultJson: {
+      const retainedResult = {
         ...updated.resultJson,
-        workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, leaseIds: retainedLeaseIds },
-      } }).where(and(eq(heartbeatRuns.id, updated.id), eq(heartbeatRuns.companyId, updated.companyId))).returning();
+        workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA, leaseIds: [...retainedLeaseIds].sort() },
+      };
+      [updated] = await tx.update(heartbeatRuns).set({
+        resultJson: retainedResult,
+        executionStatusDeliveryId: sql`case when ${heartbeatRuns.resultJson} is distinct from ${JSON.stringify(retainedResult)}::jsonb
+          then ${randomUUID()}::uuid else ${heartbeatRuns.executionStatusDeliveryId} end`,
+      }).where(and(eq(heartbeatRuns.id, updated.id), eq(heartbeatRuns.companyId, updated.companyId))).returning();
     }
     const needsRecovery = input.recordRestoreFailureOnly
       ? retainedLeaseIds.length > 0 || hasRequiredWorkspaceRecovery(updated.resultJson)

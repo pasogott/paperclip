@@ -11999,7 +11999,8 @@ async function createRunnerdBackendWithinSessionClaim(
           claudeEffort: "claudeEffort" in provider ? provider.claudeEffort : undefined,
           acpxPermissionModePinned: true } : {}),
         ...(provider.kind === "opencode" ? { opencodePermissionMode: provider.permissionMode } : {}),
-        runnerReconnectGraceMs: 120_000, lifecyclePolicy: input.execution.session.lifecyclePolicy,
+        runnerReconnectGraceMs: 120_000, runnerProcessReconnectGraceMs: null,
+        lifecyclePolicy: input.execution.session.lifecyclePolicy,
         runtimeContext: "runtimeContext" in input.execution ? input.execution.runtimeContext : null,
         externallySandboxed: true, baseInstructions: recovery?.baseInstructions,
         resumeDynamicTools: dynamicTools, resumeCompletionContract: { revision: input.execution.completionContract.contract.revision,
@@ -13494,6 +13495,10 @@ async function createRunnerdBackendWithinSessionClaim(
           ? resolveSourceCodexHome(resolveNativeProviderEnvironment(input.execution.provider, runnerEnvironment))
           : undefined,
         runnerReconnectGraceMs: remoteTarget ? 120_000 : undefined,
+        // A controller's bounded reconnect attempt is not the remote owner's
+        // lifetime. Retain it through restarts until its authenticated lease
+        // expires or explicit Stop/suspension proves that execution ended.
+        runnerProcessReconnectGraceMs: remoteTarget ? null : undefined,
         environment: effectiveRunnerEnvironment,
         observability: input.observability,
         onDiagnostic: (message) => {
