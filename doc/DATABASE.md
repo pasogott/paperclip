@@ -49,6 +49,24 @@ and leaves all existing cases passive. Source identities are not grants.
 
 ### Task query performance
 
+Agent request authentication uses a compact run-identity read. It omits saved
+execution payloads, results, and log excerpts from the query response. The read
+still locks the task before the run and reconciles pending steering from durable
+acknowledgements on every request. Default identity reads retain the full run.
+Stored payloads and separate native tool authorization checks remain unchanged.
+
+Native event acknowledgements read a count and maximum through the existing
+source-sequence index. A stream with gaps uses indexed lookups for its first
+missing successor. The acknowledgement keeps its contiguous-prefix rule without
+returning every historical sequence number. All events stay stored. Counting the
+index entries still grows with the stream length.
+
+Conversation recovery reads only the saved run fields used to settle a turn.
+Settlement locks and reads current conversation state without loading the task
+description or comment bodies. It still checks the durable reply or pending
+interaction, session generation, owning run, and newer user messages. Saved
+execution payloads, task text, and comments remain stored in full.
+
 The attention feed checks for newer runs with company-scoped existence probes.
 The probes match the failed run's agent and issue or task context. They preserve
 the existing millisecond comparison and empty-context rules. Each batch holds
@@ -156,6 +174,11 @@ those JSON values before it sends the row to the controller. Unused prompt and
 launch context does not travel with each policy or parent-report check. JSON
 types, task-key precedence, and company and agent identity checks are preserved.
 Each decision still reads current data; this is not an authorization cache.
+
+Restoring a saved monitor's receipt or completion proof creates a new native
+assessment identity even when its scheduled deadline is unchanged. The saved
+proof is part of the assessment input. Prior decisions and accepted results stay
+intact, and an unchanged replay reuses the same assessment and decision.
 
 Native tool authority lookups select current run identity, status, invocation,
 responsible user, context, and receipt data. Saved profiles and output excerpts
