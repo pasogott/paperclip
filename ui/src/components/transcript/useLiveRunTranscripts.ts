@@ -46,6 +46,7 @@ const TASK_VIEW_MAX_BYTES_PER_RUN = 2_000_000;
 const RUN_ABSENCE_PRUNE_GRACE_MS = 20_000;
 
 export interface RunTranscriptSource {
+  createdAt?: string | Date;
   id: string;
   status: string;
   adapterType: string;
@@ -142,6 +143,7 @@ export function useLiveRunTranscripts({
   const trimmedSeqFloorByRunRef = useRef(new Map<string, number>());
   const pendingLogRowsByRunRef = useRef(new Map<string, string>());
   const logOffsetByRunRef = useRef(new Map<string, number>());
+  const logReadLimitByRunRef = useRef(new Map<string, number>());
   const missingTerminalLogRunIdsRef = useRef(new Set<string>());
   // PAP-462 B3: buffered runs that dropped out of the `runs` list, mapped to the
   // wall-clock deadline (ms) after which their buffer may be pruned. A run still
@@ -268,6 +270,7 @@ export function useLiveRunTranscripts({
     for (const runId of logOffsetByRunRef.current.keys()) {
       if (!retainedRunIds.has(runId)) {
         logOffsetByRunRef.current.delete(runId);
+        logReadLimitByRunRef.current.delete(runId);
       }
     }
     for (const runId of trimmedSeqFloorByRunRef.current.keys()) {
@@ -311,14 +314,37 @@ export function useLiveRunTranscripts({
         return;
       }
       inFlightRunIds.add(run.id);
-      const offset = logOffsetByRunRef.current.get(run.id) ?? resolveInitialLogOffset(run, logReadLimitBytes);
+      let alignStartToRecord = !logOffsetByRunRef.current.has(run.id);
+      let offset = logOffsetByRunRef.current.get(run.id) ?? resolveInitialLogOffset(run, logReadLimitBytes);
+      let rewinding = false;
+      const previousReadLimit = logReadLimitByRunRef.current.get(run.id);
+      if (previousReadLimit !== undefined && logReadLimitBytes > previousReadLimit) {
+        // Expanding a compact tail must reread the earlier range. Retain the
+        // visible chunks; merging by sequence deduplicates the overlapping tail.
+        const expandedOffset = resolveInitialLogOffset(run, logReadLimitBytes);
+        if (expandedOffset < offset) {
+          alignStartToRecord = true;
+          offset = expandedOffset;
+          rewinding = true;
+        }
+      }
       try {
         const result = await readTranscriptRequest(
-          (signal) => heartbeatsApi.log(run.id, offset, logReadLimitBytes, { signal }),
+          (signal) => heartbeatsApi.log(run.id, offset, logReadLimitBytes, {
+            signal,
+            ...(alignStartToRecord && offset > 0 ? { alignStartToRecord: true } : {}),
+          }),
           controller.signal,
         );
         if (cancelled) return;
 
+        // Commit the expanded window only after success so retries still align
+        // its first record and failed reads leave the previous parser intact.
+        logReadLimitByRunRef.current.set(run.id, logReadLimitBytes);
+        if (rewinding) {
+          pendingLogRowsByRunRef.current.delete(run.id);
+          pendingLogRowsByRunRef.current.delete(`${run.id}:records`);
+        }
         setErrorsByRun((previous) => {
           if (!previous.has(run.id)) return previous;
           const next = new Map(previous);
