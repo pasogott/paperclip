@@ -72,7 +72,7 @@ export function validateManifest(value, now = Date.now(), { admission = true } =
     const provider = attempt.provider === 'codex' && attempt.acpxAgent === undefined ? 'openai'
       : attempt.provider === 'acpx' && attempt.acpxAgent === 'claude' ? 'anthropic' : null;
     const reservation = prices.get(`${provider}:${attempt.model}`);
-    if (!provider || !id(attempt.executionId) || !id(attempt.attemptId) || !hash(attempt.requestSha256)
+    if (!provider || !id(attempt.executionId) || !id(attempt.attemptId) || !/^[A-Za-z0-9_.-]+$/.test(attempt.attemptId) || !hash(attempt.requestSha256)
         || attempts.has(attempt.attemptId) || executions.has(attempt.executionId) || reservation === undefined
         || !Number.isSafeInteger(attempt.timeoutMs) || attempt.timeoutMs < 1 || attempt.timeoutMs > 4 * 3_600_000
         || !Number.isSafeInteger(attempt.maxRequests) || attempt.maxRequests < 1 || attempt.maxRequests > 1000

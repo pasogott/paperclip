@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'n
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { limitFor, readRegularFile, replaceEvidenceFile } from './evidence-files.mjs';
 import { bindRequest, canonical, costRuntime, readJson, sha256, validateManifest } from './manifest.mjs';
 
 async function atomicJson(file, value) {
@@ -42,15 +43,22 @@ async function runChild(input) {
   if (input.signal?.aborted) onAbort();
   try {
     const [code, signal] = await once(child, 'exit');
-    if (stopped) {
-      let groupPresent = true;
-      try { process.kill(-child.pid, 0); } catch (error) { if (error.code === 'ESRCH') groupPresent = false; }
-      if (groupPresent) await escalation;
-    }
+    const groupPresent = !absent(-child.pid);
+    if (groupPresent && !stopped) stop('provider_group_survived_cli_exit');
+    if (groupPresent) await escalation;
     return { code, signal, pid: child.pid, stopped, stdout: Buffer.concat(output.stdout).toString(), stderr: Buffer.concat(output.stderr).toString() };
   } finally {
     clearTimeout(timeout); clearTimeout(force); input.signal?.removeEventListener('abort', onAbort);
+    child.stdout.destroy(); child.stderr.destroy();
   }
+}
+
+export function controlledResultArtifact(artifact, report, attempt) {
+  return { ...(artifact ?? { schema: 'paperclip-runner/eval-session-artifact/v1', attemptId: attempt.attemptId,
+    requestedModel: attempt.model, infrastructureError: 'Controlled provider did not retain an artifact' }),
+    ...(report.failure ? { accountingError: 'Controlled request accounting or cleanup is incomplete',
+      accountingFailure: { class: 'provider_budget_coverage_unknown', category: 'provider_budget', retryable: false } } : {}),
+    controllerAccounting: report };
 }
 
 export async function runControlledEval({ manifestPath, requestPath, outputPath, environment = process.env, signal, transport }) {
@@ -130,10 +138,9 @@ registerHooks({ resolve(specifier, context, nextResolve) {
     child = await runChild({ cli: stagedCli, loader, requestPath: retainedRequestPath, artifactPath, descriptorPath,
       cwd: request.session.workingDirectory ?? root, environment: childEnvironment, deadlineAt, signal, closeGateway: () => gateway.close() });
     for (const stream of ['stdout', 'stderr']) await writeFile(join(root, `${stream}.log`), redact(child[stream]), { flag: 'wx', mode: 0o600 });
-    const raw = await readFile(artifactPath, 'utf8');
-    if (Buffer.byteLength(raw) > 16_777_216) throw new Error('Provider artifact exceeds its byte limit');
+    const raw = (await readRegularFile(artifactPath, limitFor('provider-artifact.json'))).toString('utf8');
     secretExcluded = secrets.every(secret => !raw.includes(secret));
-    if (!secretExcluded) await writeFile(artifactPath, redact(raw), { mode: 0o600 });
+    if (!secretExcluded) await replaceEvidenceFile(artifactPath, redact(raw));
     providerArtifactSha256 = sha256(redact(raw));
     artifact = JSON.parse(redact(raw));
     const expected = { mode: 'controller_gateway', provider, declaredUpstreamRoute: manifest.route, campaignId: manifest.campaignId,
@@ -159,20 +166,18 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   if (snapshot.overBudget || snapshot.conflictingRequests || snapshot.inflight || snapshot.unknownRequests !== snapshot.boundedUnresolvedRequests) failure ??= 'request_accounting_unbounded';
   const receiptHashes = {};
   try {
-    for (const request of snapshot.requests) receiptHashes[request.requestId] = sha256(await readFile(join(root, 'receipts', `${request.requestId}.json`)));
+    for (const request of snapshot.requests) receiptHashes[request.requestId] = sha256(await readRegularFile(join(root, 'receipts', `${request.requestId}.json`), limitFor(`receipts/${request.requestId}.json`)));
   } catch { failure ??= 'request_receipt_missing'; }
-  const ledgerSha256 = sha256(await readFile(ledgerPath));
+  let ledgerSha256;
+  try { ledgerSha256 = sha256(await readRegularFile(ledgerPath, limitFor('ledger.jsonl'))); }
+  catch { failure ??= 'ledger_evidence_invalid'; }
   const report = { schema: 'paperclip.runner-eval.control-result/v1', campaignId: manifest.campaignId, manifestSha256,
     executionId: attempt.executionId, attemptId: attempt.attemptId, requestSha256: attempt.requestSha256,
     allocationUsd: attempt.maxUsd, limits, startedAt, finishedAt: new Date().toISOString(), status: failure ? 'incomplete' : 'closed', failure,
     child: child ? { code: child.code, signal: child.signal, stopped: child.stopped } : null,
     cleanupVerified, secretExcluded, providerArtifactSha256, ledgerSha256, receiptHashes, accounting: snapshot };
   await atomicJson(join(root, 'result.json'), report);
-  const resultArtifact = artifact ?? { schema: 'paperclip-runner/eval-session-artifact/v1', attemptId: attempt.attemptId,
-    requestedModel: attempt.model, infrastructureError: 'Controlled provider did not retain an artifact' };
-  if (failure) Object.assign(resultArtifact, { accountingError: 'Controlled request accounting or cleanup is incomplete',
-    accountingFailure: { class: 'provider_budget_coverage_unknown', category: 'provider_budget', retryable: false } });
-  resultArtifact.controllerAccounting = report;
+  const resultArtifact = controlledResultArtifact(artifact, report, attempt);
   await mkdir(dirname(resolve(outputPath)), { recursive: true, mode: 0o700 });
   await writeFile(outputPath, JSON.stringify(resultArtifact, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   return { code: failure ? 2 : child?.code ?? 2, report };
