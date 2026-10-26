@@ -72,6 +72,7 @@ export function credentialForConfig(config, grokAuthenticationMode = "api_key") 
   if (config.provider === "acpx") {
     if (config.acpxAgent === "pi") return "OPENROUTER_API_KEY";
     if (config.acpxAgent === "claude") return "ANTHROPIC_API_KEY";
+    if (config.acpxAgent === "copilot") return "COPILOT_GITHUB_TOKEN";
     if (config.acpxAgent === "grok") {
       return validateGrokAuthenticationMode(grokAuthenticationMode) === "subscription"
         ? "PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET"

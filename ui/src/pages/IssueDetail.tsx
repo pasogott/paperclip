@@ -1203,6 +1203,11 @@ function InboxMobileToolbar({
   );
 }
 
+interface RecentIssueRunWindow {
+  runs: RunForIssue[];
+  hasEarlierRuns: boolean;
+}
+
 type IssueDetailChatTabProps = {
   executionBlocked?: boolean;
   interruption?: Issue["interruption"];
@@ -1620,37 +1625,48 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   const hasLiveRuns = liveRunCount > 0 || !!resolvedActiveRun;
   const linkedRunsKey = historyExpanded
     ? queryKeys.issues.runs(issueQueryRef)
-    : [...queryKeys.issues.runs(issueQueryRef), "recent"];
+    : [...queryKeys.issues.runs(issueQueryRef), "recent-window"];
   const {
-    data: linkedRuns,
+    data: linkedRunHistory,
     isPending: linkedRunsPending,
     isError: linkedRunsError,
     refetch: refetchLinkedRuns,
-  } = useQuery({
+  } = useQuery<RunForIssue[] | RecentIssueRunWindow>({
     queryKey: linkedRunsKey,
     queryFn: async () => {
       if (historyExpanded) return activityApi.runsForIssue(issueQueryRef);
       let recent = await activityApi.recentRunsForIssue(issueQueryRef);
-      let previous = queryClient.getQueryData<RunForIssue[]>(linkedRunsKey) ?? [];
+      const previousWindow = queryClient.getQueryData<RecentIssueRunWindow>(linkedRunsKey);
+      let previous = previousWindow?.runs ?? [];
+      let reconciledFullHistory = false;
       if (previous.some((run) =>
         (run.status === "running" || run.status === "queued") && !recent.some((next) => next.runId === run.runId),
       )) {
         // After a reconnect, several turns may have completed beyond the small
         // window. Reconcile watched runs once against authoritative summaries.
         recent = await activityApi.runsForIssue(issueQueryRef);
+        reconciledFullHistory = true;
         const existingRunIds = new Set(recent.map((run) => run.runId));
         previous = previous.filter((run) => existingRunIds.has(run.runId));
       }
       // The second row refreshes a just-finished predecessor. Start with only
       // the latest run, then keep every run observed while this task is open.
       const visible = new Set([...previous.map((run) => run.runId), ...recent.slice(0, 1).map((run) => run.runId)]);
-      return [...new Map([...previous, ...recent].filter((run) => visible.has(run.runId)).map((run) => [run.runId, run])).values()];
+      return {
+        runs: [...new Map([...previous, ...recent].filter((run) => visible.has(run.runId)).map((run) => [run.runId, run])).values()],
+        // A first run is already visible. The disclosure needs evidence of an
+        // omitted run, and must retain that evidence as later turns arrive.
+        hasEarlierRuns: recent.some((run) => !visible.has(run.runId))
+          || (!reconciledFullHistory && recent.length >= 2 && previousWindow?.hasEarlierRuns === true),
+      };
     },
     enabled: !!issueId,
     refetchInterval:
       hasLiveRuns || issueStatus === "in_progress" ? 1000 : false,
-    placeholderData: historyExpanded ? queryClient.getQueryData<RunForIssue[]>([...queryKeys.issues.runs(issueQueryRef), "recent"]) : undefined,
+    placeholderData: historyExpanded ? queryClient.getQueryData<RecentIssueRunWindow>([...queryKeys.issues.runs(issueQueryRef), "recent-window"])?.runs : undefined,
   });
+  const linkedRuns = Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs;
+  const hasEarlierRuns = !Array.isArray(linkedRunHistory) && linkedRunHistory?.hasEarlierRuns === true;
   const resolvedActivity = useMemo(
     () => [...new Map([...(activity ?? []), ...(inputFacts.data ?? [])].map((event) => [event.id, event])).values()],
     [activity, inputFacts.data],
@@ -2560,7 +2576,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           <ThreadComponent
             {...(!classicTaskInterfaceEnabled ? {
               compactHistory: !historyExpanded,
-              historyControl: !historyExpanded && (hasEarlierMessages || (linkedRuns?.length ?? 0) > 0) ? (
+              onExpandHistory,
+              historyControl: !historyExpanded && (hasEarlierMessages || hasEarlierRuns) ? (
                 <Button type="button" variant="ghost" size="sm" onClick={onExpandHistory}>
                   More messages
                 </Button>
@@ -7661,6 +7678,18 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 </Button>
               </PopoverTrigger>
               <PopoverContent className="w-52 p-1" align="end">
+                {taskChatShellEnabled && !historyExpanded ? (
+                  <button
+                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/50"
+                    onClick={() => {
+                      expandHistory();
+                      setMoreOpen(false);
+                    }}
+                  >
+                    <ActivityIcon className="h-3 w-3" />
+                    Show task activity
+                  </button>
+                ) : null}
                 {streamlinedTaskDetailEnabled ? (
                   <>
                     <button
@@ -7882,11 +7911,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           data-task-chat-shell={taskChatShellEnabled ? "" : undefined}
           className={
             taskChatShellEnabled
-              ? isMobile
-                ? // Mobile shell scrolls the DOCUMENT (main is overflow-visible,
-                  // auto height) — the thread renders in normal flow (PAP-360).
-                  "flex w-full flex-col gap-6"
-                : // Fill main exactly so the outer page never scrolls — the
+              ? // Fill main exactly so the outer page never scrolls — the
                   // thread's own viewport is the only scroll surface.
                   // Keep status banners close to the transcript. A full section
                   // gap here shortens the pinned message viewport enough to
@@ -8180,9 +8205,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             onValueChange={setDetailTab}
             className={
               taskChatShellEnabled
-                ? isMobile
-                  ? undefined
-                  : "min-h-0 flex-1"
+                ? "min-h-0 flex-1"
                 : "space-y-3"
             }
           >
@@ -8222,8 +8245,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 taskChatShellEnabled
                   ? isMobile
                     ? streamlinedTaskDetailEnabled
-                      ? undefined
-                      : "-mx-4"
+                      ? "flex min-h-0 flex-1 flex-col"
+                      : "-mx-4 flex min-h-0 flex-1 flex-col"
                     : streamlinedTaskDetailEnabled
                       ? "flex min-h-0 flex-col"
                       : "-mx-4 -mt-4 md:-mx-6 md:-mt-6 flex min-h-0 flex-col"

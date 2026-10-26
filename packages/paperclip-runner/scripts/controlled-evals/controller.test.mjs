@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { canonical, costRuntime, requestBindingSha256, sha256, validateManifest } from './manifest.mjs';
+import { fileURLToPath } from 'node:url';
+import { canonical, costRuntime, observabilityBoundConfiguration, requestBindingSha256, sha256, validateManifest } from './manifest.mjs';
 import { attemptDirectory, runControlledEval } from './run.mjs';
 import { summarizeControlledCampaign } from './report.mjs';
 import { readRegularFile, replaceEvidenceFile } from './evidence-files.mjs';
@@ -17,11 +18,12 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
-import {readFile,writeFile,rm,readdir,symlink,truncate} from 'node:fs/promises';
+import {readFile,writeFile,rm,readdir,symlink,truncate,mkdir} from 'node:fs/promises';
 import {dirname,join} from 'node:path';
 import {execFileSync} from 'node:child_process';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]);
 const request=JSON.parse(await readFile(args.get('--request'),'utf8'));
+if(${Boolean(options.failChild)})process.exit(3);
 if(${Boolean(options.resistantDescendant)}) {
  const orphan=${Boolean(options.orphanExit)};
  const descendant=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});"+(orphan?"process.send('ready');":"process.stdout.write('ready');")+"setInterval(()=>{},1000)"],{stdio:orphan?['ignore','inherit','inherit','ipc']:['ignore','pipe','ignore']});
@@ -36,11 +38,35 @@ for(let i=0;i<${options.requests ?? 3};i++){
  const response=await fetch(descriptor.baseUrl+(descriptor.provider==='openai'?'/v1/responses':'/v1/messages'),{method:'POST',headers:{authorization:'Bearer '+process.env.PAPERCLIP_RUNNER_EVAL_GATEWAY_TOKEN,'content-type':'application/json'},body:JSON.stringify({model:request.model,input:'synthetic fixture'})});
  statuses.push(response.status);await response.text();
 }
+let nativeObservability;
+if(args.has('--observability-config')) {
+ const raw=await readFile(args.get('--observability-config'),'utf8'),config=JSON.parse(raw);
+ const parent=decodeURIComponent(config.launch.environment.OTEL_EXPORTER_OTLP_TRACES_HEADERS.slice('x-bt-parent='.length));
+ for(const signal of ['logs','traces'])for(let i=0;i<${options.otelRequests ?? 1};i++) {
+  const body=signal==='logs'?{resourceLogs:[{scopeLogs:[{logRecords:[{body:{stringValue:'synthetic-native-content'}}]}]}]}:{resourceSpans:[{scopeSpans:[{spans:[{traceId:'1'.repeat(32),spanId:'2'.repeat(16),name:'synthetic-native-span'}]}]}]};
+  const response=await fetch(config.baseUrl+'/v1/'+signal,{method:'POST',headers:{authorization:'Bearer '+process.env.PAPERCLIP_RUNNER_EVAL_OTLP_TOKEN,'x-bt-parent':parent,'content-type':'application/json'},body:JSON.stringify(body)});
+  await response.arrayBuffer();
+ }
+ nativeObservability={mode:'controller_otlp',configured:true,verification:'unverified',projectId:config.projectId,traceId:config.traceId,spanId:config.spanId,descriptorSha256:createHash('sha256').update(raw).digest('hex')};
+ if(${Boolean(options.realObservabilityValidator)}) {
+  const {createRequire}=await import('node:module');
+  const require=createRequire(${JSON.stringify(fileURLToPath(new URL('../../../../server/package.json', import.meta.url)))});
+  const {tsImport}=await import(require.resolve('tsx/esm/api'));
+  const {prepareEvalObservabilityRuntime}=await tsImport(${JSON.stringify(fileURLToPath(new URL('../../src/cli/eval-observability-runtime.ts', import.meta.url)))},import.meta.url);
+  await mkdir(process.env.HOME+'/codex',{recursive:true});
+  const prepared=await prepareEvalObservabilityRuntime(args.get('--observability-config'),request,
+   {evidence:{campaignId:descriptor.campaignId,executionId:descriptor.executionId},transportOptions:{environment:{CODEX_HOME:process.env.HOME+'/codex'}}},process.env);
+  assert.deepEqual(prepared.evidence,nativeObservability);
+  for(const signal of ['LOGS','TRACES'])assert(prepared.transportOptions.environment['OTEL_EXPORTER_OTLP_'+signal+'_HEADERS'].includes(encodeURIComponent('Bearer '+process.env.PAPERCLIP_RUNNER_EVAL_OTLP_TOKEN)));
+  nativeObservability=prepared.evidence;
+ }
+
+}
 if(${Boolean(options.waitForever)})await new Promise(()=>setInterval(()=>{},1000));
 if(!${Boolean(options.missingArtifact)})await writeFile(args.get('--output'),JSON.stringify({schema:'paperclip-runner/eval-session-artifact/v1',attemptId:request.attemptId,requestedModel:request.model,
  requestRouting:${options.missingRoute ? 'null' : "{mode:'controller_gateway',provider:descriptor.provider,declaredUpstreamRoute:descriptor.upstreamRoute,campaignId:descriptor.campaignId,executionId:descriptor.executionId,attemptId:descriptor.attemptId,descriptorSha256:createHash('sha256').update(descriptorRaw).digest('hex')}"},
- snapshot:{status:'closed',process:{runnerExited:true,runnerPid:process.pid,providerPid:process.pid}},statuses,
- leaked:${options.leakToken ? 'process.env.PAPERCLIP_RUNNER_EVAL_GATEWAY_TOKEN' : 'null'}}));
+ nativeObservability, snapshot:{status:'closed',process:{runnerExited:true,runnerPid:process.pid,providerPid:process.pid}},statuses,
+ leaked:${options.leakToken ? 'process.env.PAPERCLIP_RUNNER_EVAL_GATEWAY_TOKEN' : options.leakOtlpToken ? 'process.env.PAPERCLIP_RUNNER_EVAL_OTLP_TOKEN' : 'null'}}));
 if(${Boolean(options.invalidEvidence)}) {
  const root=dirname(args.get('--output'));
  const name=${JSON.stringify(options.invalidEvidence ?? '')};
@@ -51,6 +77,7 @@ if(${Boolean(options.invalidEvidence)}) {
  else if(kind==='symlink')await symlink('/dev/zero',file);
  else {await writeFile(file,'');await truncate(file,16*1024*1024+1);}
 }
+
 if(${Boolean(options.orphanExit)})process.exit(0);
 `;
 
@@ -82,11 +109,17 @@ async function fixture(t, { count = 1, allocation = '0.01', providerProfile = 'c
     await writeFile(requestPath, JSON.stringify(request)); requests.push({ request, requestPath, outputPath });
     manifest.attempts.push({ executionId: `execution-${index}`, attemptId: request.attemptId, requestSha256: requestBindingSha256(request), provider: request.provider, ...(request.acpxAgent ? { acpxAgent: request.acpxAgent } : {}), model: 'fixture', maxUsd: allocation, maxRequests: 2, maxConcurrent: 1, timeoutMs: 5000 });
   }
+  if (options.observability) {
+    manifest.observability = { projectId: '11111111-1111-4111-8111-111111111111',
+      capture: { userPrompts: false, assistantResponses: false, toolDetails: false, toolContent: false },
+      nativeLimits: { maxRequests: 4, maxRequestBytes: 16384, maxTotalBytes: 32768, maxConcurrent: 1, maxExpandedBytes: 65536, maxRecords: 16 } };
+    manifest.observability.provisionalBound = bound(observabilityBoundConfiguration(manifest));
+  }
   const manifestPath = join(root, 'manifest.json');
   const save = () => writeFile(manifestPath, JSON.stringify(manifest)); await save();
   const environment = { PATH: process.env.PATH, OPENAI_API_KEY: 'synthetic-upstream-private', ANTHROPIC_API_KEY: 'other-private', BRAINTRUST_API_KEY: 'other-braintrust', GH_TOKEN: 'other-github', NODE_OPTIONS: '--require must-not-inherit', PYTHONPATH: '/must-not-inherit' };
   return { root, manifest, manifestPath, requests, environment, save,
-    run: (index = 0, transport = () => success(biller), signal) => runControlledEval({ manifestPath, ...requests[index], environment, transport, signal }) };
+    run: (index = 0, transport = () => success(biller), signal) => runControlledEval({ manifestPath, ...requests[index], environment, transport, signal, otlpTransport: options.otlpTransport ?? (async () => Response.json({})) }) };
 }
 let sequence = 0;
 function success(provider = 'openai') {
@@ -105,7 +138,7 @@ test('real child requests reserve before dispatch, stop at the cap and retain on
     assert.equal(ledger.state.snapshot().inflight, 1);
     return success();
   });
-  assert.equal(calls, 2); assert.equal(result.code, 0); assert.equal(result.report.cleanupVerified, true);
+  assert.equal(calls, 2); assert.equal(result.code, 0, JSON.stringify(result.report)); assert.equal(result.report.cleanupVerified, true);
   const artifact = JSON.parse(await readFile(f.requests[0].outputPath, 'utf8'));
   assert.deepEqual(artifact.statuses, [200, 200, 429]);
   assert.equal(artifact.controllerAccounting.accounting.knownUsd, '0.000136000');
@@ -406,10 +439,10 @@ for (const name of ['provider-artifact.json', 'receipt', 'ledger.jsonl']) for (c
 }
 
 test('durable reports bound every evidence file and retain full holds for invalid proof', { timeout: 20_000 }, async t => {
-  const f = await fixture(t, { requests: 1 }); await f.run();
+  const f = await fixture(t, { requests: 1, observability: true }); await f.run();
   const root = attemptDirectory(f.manifest, 'attempt-0');
   const receipt = `receipts/${(await readdir(join(root, 'receipts')))[0]}`;
-  for (const name of ['admission.json', 'request.json', 'result.json', 'provider-artifact.json', 'gateway.json', 'ledger.jsonl', receipt]) {
+  for (const name of ['admission.json', 'request.json', 'result.json', 'provider-artifact.json', 'gateway.json', 'ledger.jsonl', receipt, 'observability.json', 'otlp-native.jsonl', 'otlp-controller.jsonl', 'otlp-root.json']) {
     const path = join(root, name), original = await readFile(path);
     for (const kind of ['fifo', 'symlink', 'oversized']) {
       await rm(path);
@@ -534,6 +567,148 @@ test('campaign collection retains and audits private archives, while public proj
   await assert.rejects(aggregateProtocolEvalCampaign(input), /Missing private controller evidence/);
 });
 
+for (const providerProfile of ['codex', 'claude']) test(`controller owns native ${providerProfile} trace routing and offline receipts after workspace deletion`, async t => {
+  const received = [];
+  const f = await fixture(t, { providerProfile, observability: true, requests: 1, otlpTransport: async (url, init) => {
+    received.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(Buffer.from(init.body).toString()) });
+    return Response.json({});
+  } });
+  const result = await f.run();
+  assert.equal(result.code, 0); assert.equal(received.length, 3);
+  const evidence = result.report.observability;
+  assert.equal(evidence.status, 'accepted'); assert.equal(evidence.verification, 'unverified');
+  assert.equal(evidence.native.admittedRecords, 2); assert.equal(evidence.controller.admittedRecords, 1);
+  assert(received.every(item => item.headers.get('authorization') === 'Bearer other-braintrust'));
+  assert.equal(received[0].headers.get('x-bt-parent'), costRuntime.exportBraintrustAttemptParent(evidence));
+  assert.equal(received[2].headers.get('x-bt-parent'), `project_id:${f.manifest.observability.projectId}`);
+  const root = received[2].body.resourceSpans[0].scopeSpans[0].spans[0];
+  assert.equal(root.traceId, evidence.traceId); assert.equal(root.spanId, evidence.spanId);
+  assert(root.attributes.some(item => item.key === 'paperclip.eval.request_sha256' && item.value.stringValue === f.manifest.attempts[0].requestSha256));
+  assert(!JSON.stringify(root).includes('synthetic-native-content'));
+  const archive = await packControlledAttempt({ manifest: f.manifest, attemptId: 'attempt-0', environment: f.environment });
+  assert(!JSON.stringify(archive).includes('other-braintrust'));
+  await rm(f.manifest.outputDirectory, { recursive: true });
+  await rm(f.requests[0].request.session.workingDirectory, { recursive: true });
+  const summary = await summarizeControlledEvidence([archive]);
+  assert.equal(summary.incompleteAttempts, 0); assert.equal(summary.campaigns[0].attempts[0].observability.status, 'accepted');
+  assert.equal(summary.campaigns[0].operatingHeldUsd, '0.004000000');
+});
+
+test('native capacity, capture, selection and operating bound changes require new qualification', async t => {
+  const f = await fixture(t, { observability: true });
+  for (const mutate of [
+    value => { value.observability.nativeLimits.maxTotalBytes++; },
+    value => { value.observability.capture.userPrompts = true; },
+    value => { value.observability.projectId = '22222222-2222-4222-8222-222222222222'; },
+    value => { value.attempts[0].requestSha256 = 'c'.repeat(64); },
+    value => { value.overhead.components.find(item => item.component === 'observability').provisionalBound.evidenceSha256 = 'c'.repeat(64); },
+    value => { delete value.observability.provisionalBound; },
+  ]) { const manifest = structuredClone(f.manifest); mutate(manifest); assert.throws(() => validateManifest(manifest)); }
+  const noKey = { ...f.environment }; delete noKey.BRAINTRUST_API_KEY;
+  await assert.rejects(runControlledEval({ manifestPath: f.manifestPath, ...f.requests[0], environment: noKey }), /observability credential/);
+  await assert.rejects(readFile(join(f.manifest.outputDirectory, 'admission.json')), { code: 'ENOENT' });
+});
+
+for (const fault of ['partial', 'quota', 'leak']) test(`native ${fault} preserves model cost and holds the unresolved attempt`, async t => {
+  const f = await fixture(t, { observability: true, requests: 1, otelRequests: fault === 'quota' ? 3 : 1,
+    leakOtlpToken: fault === 'leak', otlpTransport: async url => fault === 'partial'
+      ? Response.json({ partialSuccess: String(url).endsWith('/logs') ? { rejectedLogRecords: 1 } : { rejectedSpans: 1 } }) : Response.json({}) });
+  const result = await f.run();
+  assert.equal(result.code, 2); assert.equal(result.report.status, 'incomplete');
+  const summary = await summarizeControlledCampaign(f.manifest);
+  assert.equal(summary.knownUsd, '0.000068000'); assert.equal(summary.committedUsd, '0.014000000');
+  const artifact = JSON.parse(await readFile(f.requests[0].outputPath, 'utf8'));
+  assert.equal(artifact.accountingFailure.retryable, false);
+  if (fault === 'leak') { assert.equal(artifact.leaked, '[redacted]'); assert.equal(result.report.secretExcluded, false); }
+});
+
+test('offline replay refuses lost receipts and forged acceptance even when file hashes are updated', async t => {
+  const f = await fixture(t, { observability: true, requests: 1 }); await f.run();
+  const root = attemptDirectory(f.manifest, 'attempt-0'), path = join(root, 'otlp-native.jsonl');
+  const original = await readFile(path);
+  await rm(path);
+  assert.equal((await summarizeControlledCampaign(f.manifest)).incompleteAttempts, 1);
+  const rows = original.toString().trim().split('\n').map(line => JSON.parse(line));
+  rows.find(row => row.type === 'outcome').outcome = 'partial';
+  const bytes = Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  await writeFile(path, bytes);
+  const reportPath = join(root, 'result.json'), report = JSON.parse(await readFile(reportPath, 'utf8'));
+  report.observability.receiptHashes.native = sha256(bytes); await writeFile(reportPath, JSON.stringify(report));
+  const summary = await summarizeControlledCampaign(f.manifest);
+  assert.equal(summary.incompleteAttempts, 1); assert.equal(summary.committedUsd, '0.014000000');
+});
+
+test('cancellation aborts a pending native export and retains its uncertain receipt and model allocation', async t => {
+  const cancellation = new AbortController(); let aborted = false;
+  const f = await fixture(t, { observability: true, requests: 1, otlpTransport: async (_url, init) => {
+    queueMicrotask(() => cancellation.abort());
+    return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => { aborted = true; reject(new Error('synthetic abort')); }, { once: true }));
+  } });
+  const result = await f.run(0, () => success(), cancellation.signal);
+  assert.equal(result.code, 2); assert.equal(aborted, true); assert.equal(result.report.child.stopped, 'controller_cancelled');
+  const rows = (await readFile(join(attemptDirectory(f.manifest, 'attempt-0'), 'otlp-native.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.find(row => row.type === 'outcome').outcome, 'uncertain'); assert.equal(rows.at(-1).type, 'closed');
+  const summary = await summarizeControlledCampaign(f.manifest);
+  assert.equal(summary.knownUsd, '0.000068000'); assert.equal(summary.committedUsd, '0.014000000');
+});
+
+test('lost ledger finalization still closes both OTLP relays', async t => {
+  const f = await fixture(t, { observability: true, requests: 1 });
+  const root = attemptDirectory(f.manifest, 'attempt-0');
+  const result = await f.run(0, async () => { await rm(join(root, 'ledger.jsonl')); return success(); });
+  assert.equal(result.code, 2); assert.equal(result.report.failure, 'ledger_evidence_invalid');
+  assert.equal((await summarizeControlledCampaign(f.manifest)).committedUsd, '0.014000000');
+  for (const file of ['otlp-native.jsonl', 'otlp-controller.jsonl']) {
+    const rows = (await readFile(join(root, file), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(rows.at(-1).type, 'closed');
+  }
+  const descriptor = JSON.parse(await readFile(join(root, 'observability.json'), 'utf8'));
+  await assert.rejects(fetch(descriptor.baseUrl + '/v1/logs'));
+});
+
+for (const nativeFault of ['partial', 'quota']) test(`root includes ${nativeFault} native export failure before finalization`, async t => {
+  let rootPayload;
+  const f = await fixture(t, { observability: true, requests: 1, otelRequests: nativeFault === 'quota' ? 3 : 1,
+    otlpTransport: async (url, init) => {
+      if (new Headers(init.headers).get('x-bt-parent').startsWith('project_id:')) {
+        rootPayload = JSON.parse(Buffer.from(init.body).toString()); return Response.json({});
+      }
+      return nativeFault === 'partial' ? Response.json({ partialSuccess: String(url).endsWith('/logs') ? { rejectedLogRecords: 1 } : { rejectedSpans: 1 } }) : Response.json({});
+    } });
+  const result = await f.run();
+  assert.equal(result.code, 2); assert.equal(result.report.observability.traceFailure, 'native_export_incomplete');
+  const attributes = rootPayload.resourceSpans[0].scopeSpans[0].spans[0].attributes;
+  assert(attributes.some(item => item.key === 'paperclip.eval.controller_status_before_root_export' && item.value.stringValue === 'incomplete'));
+});
+
+test('cancellation during root export stops forwarding and cannot close the attempt successfully', async t => {
+  const cancellation = new AbortController(); let rootAborted = false;
+  const f = await fixture(t, { observability: true, requests: 1, otlpTransport: async (_url, init) => {
+    if (!new Headers(init.headers).get('x-bt-parent').startsWith('project_id:')) return Response.json({});
+    queueMicrotask(() => cancellation.abort());
+    return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => { rootAborted = true; reject(new Error('synthetic root abort')); }, { once: true }));
+  } });
+  const result = await f.run(0, () => success(), cancellation.signal);
+  assert.equal(rootAborted, true); assert.equal(result.code, 2); assert.equal(result.report.failure, 'controller_cancelled');
+  assert.equal(result.report.status, 'incomplete'); assert.equal(result.report.cleanupVerified, true);
+  const root = attemptDirectory(f.manifest, 'attempt-0');
+  const rows = (await readFile(join(root, 'otlp-controller.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.find(row => row.type === 'outcome').outcome, 'uncertain'); assert.equal(rows.at(-1).type, 'closed');
+  const summary = await summarizeControlledCampaign(f.manifest);
+  assert.equal(summary.committedUsd, '0.014000000'); assert.equal(summary.knownUsd, '0.000068000');
+});
+
+for (const name of ['observability.json', 'otlp-native.jsonl', 'otlp-controller.jsonl']) for (const kind of ['fifo', 'symlink', 'oversized']) {
+  test(`native post-child ${name} rejects ${kind} and retains model cost plus the full hold`, { timeout: 20_000 }, async t => {
+    const f = await fixture(t, { requests: 1, observability: true, invalidEvidence: name, invalidFileType: kind });
+    const result = await f.run();
+    assert.equal(result.code, 2);
+    const summary = await summarizeControlledCampaign(f.manifest);
+    assert.equal(summary.incompleteAttempts, 1);
+    assert.equal(summary.knownUsd, '0.000068000');
+    assert.equal(summary.committedUsd, '0.014000000');
+  });
+}
 
 test('credential redaction replaces a swapped symlink without changing its target', async t => {
   const f = await fixture(t, { leakToken: true, requests: 0 });
@@ -573,4 +748,70 @@ test('missing provider artifacts cannot bypass immutable result binding', async 
   malformed.files['result.json'] = { sizeBytes: bytes.length, sha256: sha256(bytes), base64: bytes.toString('base64') };
   await writeFile(join(directory, 'controller-evidence.json'), JSON.stringify(malformed));
   await assert.rejects(readAttemptControlledEvidence(directory), /Malformed immutable controller result proof/);
+});
+
+
+test('failed final OTLP receipt write returns its saved incomplete report', async t => {
+  const f = await fixture(t, { observability: true, requests: 1 });
+  const root = attemptDirectory(f.manifest, 'attempt-0');
+  const probe = await open(join(f.root, 'prototype-probe'), 'wx');
+  const prototype = Object.getPrototypeOf(probe), original = prototype.writeFile;
+  await probe.close();
+  let failed = false;
+  prototype.writeFile = async function (data, ...options) {
+    if (String(data).includes('"type":"closed"')) {
+      const native = await stat(join(root, 'otlp-native.jsonl')).catch(() => null);
+      if (native && (await this.stat()).ino === native.ino) {
+        failed = true;
+        throw Object.assign(new Error('synthetic final receipt write failure'), { code: 'ENOSPC' });
+      }
+    }
+    return original.call(this, data, ...options);
+  };
+  t.after(() => { prototype.writeFile = original; });
+  const result = await f.run();
+  assert.equal(failed, true); assert.equal(result.code, 2);
+  assert.equal(result.report.status, 'incomplete');
+  assert.deepEqual(JSON.parse(await readFile(join(root, 'result.json'), 'utf8')), result.report);
+  const summary = await summarizeControlledCampaign(f.manifest);
+  assert.equal(summary.knownUsd, '0.000068000'); assert.equal(summary.committedUsd, '0.014000000');
+  const controller = (await readFile(join(root, 'otlp-controller.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(controller.at(-1).type, 'closed');
+  const descriptor = JSON.parse(await readFile(join(root, 'observability.json'), 'utf8'));
+  await assert.rejects(fetch(descriptor.baseUrl + '/v1/logs'));
+});
+
+
+for (const providerProfile of ['codex', 'claude']) test(`controller descriptor round trips through the real ${providerProfile} CLI validator`, async t => {
+  const f = await fixture(t, { providerProfile, observability: true, realObservabilityValidator: true, requests: 0 });
+  const result = await f.run();
+  assert.equal(result.code, 0, JSON.stringify(result.report) + '\n' + await readFile(join(attemptDirectory(f.manifest, 'attempt-0'), 'stderr.log'), 'utf8'));
+  assert.equal(result.report.observability.status, 'accepted');
+  const bundle = await packControlledAttempt({ manifest: f.manifest, attemptId: 'attempt-0' });
+  assert.equal((await summarizeControlledEvidence([bundle])).incompleteAttempts, 0);
+});
+
+test('retained failure codes distinguish native startup, child exit and invalid artifacts', async t => {
+  const startup = await fixture(t, { observability: true, requests: 0 });
+  const root = attemptDirectory(startup.manifest, 'attempt-0');
+  const probe = await open(join(startup.root, 'startup-probe'), 'wx');
+  const prototype = Object.getPrototypeOf(probe), original = prototype.sync; await probe.close();
+  let failed = false;
+  prototype.sync = async function (...args) {
+    const native = await stat(join(root, 'otlp-native.jsonl')).catch(() => null);
+    if (native && (await this.stat()).ino === native.ino) {
+      failed = true; throw Object.assign(new Error('synthetic native startup persistence failure'), { code: 'ENOSPC' });
+    }
+    return original.call(this, ...args);
+  };
+  t.after(() => { prototype.sync = original; });
+  const result = await startup.run();
+  prototype.sync = original;
+  assert.equal(failed, true); assert.equal(result.code, 2);
+  assert.equal(result.report.failure, 'observability_start_failed');
+  assert.equal((await summarizeControlledCampaign(startup.manifest)).committedUsd, '0.014000000');
+  const child = await fixture(t, { failChild: true, requests: 0 });
+  assert.equal((await child.run()).report.failure, 'child_failed');
+  const artifact = await fixture(t, { missingRoute: true, requests: 0 });
+  assert.equal((await artifact.run()).report.failure, 'artifact_invalid');
 });

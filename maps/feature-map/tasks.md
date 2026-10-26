@@ -39,7 +39,7 @@ Open `/issues` or a project’s Issues view; legacy `/tasks` links redirect.
 
 ### `task-detail`
 
-Open `/issues/:issueId` from a row, mention, or direct link. Cold opens show the instruction and recent exchange first. **More messages** loads earlier messages and run activity; incoming messages remain visible while the task stays open.
+Open `/issues/:issueId` from a row, mention, or direct link. Cold opens show the instruction and recent exchange first. **More messages** appears only when earlier comments or runs are omitted and loads that history. Fresh tasks with no omitted history have no disclosure. A single legacy run with a truncated log offers **More run output** instead. **More task actions → Show task activity** loads full activity even for a single native run; incoming messages remain visible while the task stays open.
 
 ### `task-sharing`
 
