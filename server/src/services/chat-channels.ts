@@ -1,6 +1,7 @@
 import { leasedChatProvider } from "./chat-channels/runtime/receiver-policy.js";
 import { chatReceiverSchedule } from "./chat-channels/runtime/receiver-schedule.js";
 import { registerChatReceiverWork } from "./chat-channels/runtime/receiver-work.js";
+import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { notifyChatEndpointConfiguration } from "./chat-channels/configuration-work-notifications.js";
 import { registerDiscordCommandWork } from "./chat-channels/discord/command-work.js";
 import { discordCommandSchedule } from "./chat-channels/discord/command-schedule.js";
@@ -1251,7 +1252,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     stageTerminalReceiptReactionRemovals, runtimeContextForRecord, scheduleMessageProcessing, processReceiptReaction,
   });
   const { stageTeamsBoardFileIntent, deriveTeamsFileTransferAuthority } = createTeamsFileAuthority({ runtimeGeneration, credentialFingerprint, runtime, runtimeContexts, localRuntimeEpoch, runtimeVersions, lockCurrentPrincipalAuthorization, lifecycleRuntimeFence, assertFailedRetryReceipt, inboundWakeScope, failedChatRetrySource, isExplicitOperatorPublication, retryCommentIds });
-  const { teamsTransferProtocol, handleTeamsFileConsent, tryProcessTeamsFilePublication, scheduleTeamsFileMaintenance } = createTeamsFileDelivery(db, {
+  const { registerTeamsAttemptRecoveryWork, registerTeamsConsentExpiryWork, teamsTransferProtocol, handleTeamsFileConsent, tryProcessTeamsFilePublication } = createTeamsFileDelivery(db, {
     endpointRecord, runtimeContextForRecord, runtimeFor, runtimeContexts, localRuntimeEpoch, runtime,
     deriveTeamsFileTransferAuthority, publicationFiles, scheduleMessageProcessing, processPendingPublications,
     withCredentialMutationLease, teamsFileRetryAfter, isShuttingDown: () => shuttingDown,
@@ -2121,6 +2122,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         taskUserId: string | null,
       ) => {
         let conversation = existingConversation;
+        if (conversation) {
+          await notifyChatRunMilestones(taskTx, { companyId: taskEndpoint.companyId, issueId: conversation.issueId });
+        }
         if (!conversation) {
           const [taskResource] = await taskTx.select({ executionDefaults: chatEndpointResources.executionDefaults })
             .from(chatEndpointResources).where(and(eq(chatEndpointResources.id, resource.id), eq(chatEndpointResources.endpointId, taskEndpoint.id)));
@@ -2162,6 +2166,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             },
             taskTx,
           );
+          await notifyChatRunMilestones(taskTx, { companyId: taskEndpoint.companyId, issueId: issue.id });
           await taskTx
             .insert(chatConversations)
             .values({
@@ -3342,7 +3347,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   });
 
   async function processPublicationMaintenance(limit = 25) {
-    scheduleTeamsFileMaintenance();
     scheduleGitHubMaintenance();
     await enqueueInboundWakeupPublications();
     await reconcileTerminalConfirmationActions(limit);
@@ -3498,6 +3502,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const { prepareTeamsBoardSend } = createTeamsBoardSendPreparation(db, { endpointRecord, runtimeFor });
   const { getPublicationBatchStatus, publishComment, publishBoardMessage } = createChatPublicationRequests(db, { endpointRecord, stageTeamsBoardFileIntent, processPendingSlackBoardMessages, processPendingPublications, prepareTeamsBoardSend });
 return {
+    registerTeamsAttemptRecoveryWork,
+    registerTeamsConsentExpiryWork,
     registerCommandWork,
     registerReceiverWork,
     voice,
