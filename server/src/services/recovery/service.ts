@@ -1,3 +1,5 @@
+import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
+import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-notifications.js";
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
@@ -6262,6 +6264,8 @@ export function recoveryService(
       const [candidate] = await tx.select().from(heartbeatRuns).where(eligible).for("update");
       if (!candidate) return null;
       await notifyInstructionCollection(tx, { companyId: candidate.companyId, runId: candidate.id });
+      await notifyExternalAgentSettlement(tx, { companyId: candidate.companyId, runId: candidate.id });
+      await notifyNativeEnvironmentSettlement(tx, { companyId: candidate.companyId, runId: candidate.id });
       await notifyCancelledWorkspacePreservation(tx, { companyId: candidate.companyId, runId: candidate.id });
       const boundIssueId = boundRunIssueId(candidate);
       if (boundIssueId) {

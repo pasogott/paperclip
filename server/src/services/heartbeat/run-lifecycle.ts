@@ -1,3 +1,5 @@
+import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
+import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
 import { notifyNativeRunProjection } from "../native-run-projection-notifications.js";
@@ -1028,8 +1030,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // commit cannot strand newly-actionable accounting after the live event.
     return db.transaction(async transaction => {
       const tx = transaction as unknown as Db;
+      if (previous?.runtimeMode === "native" && isHeartbeatRunTerminalStatus(status))
+        await notifyExternalAgentSettlement(tx, { companyId: previous.companyId, runId: previous.id });
       if (previous?.runtimeMode === "native") await notifyNativeRecoveryNotices(tx, { companyId: previous.companyId, runId: previous.id });
       if (previous?.runtimeMode === "native") await notifyNativeRunProjection(tx, { companyId: previous.companyId, runId: previous.id });
+      if (previous?.runtimeMode === "native") await notifyNativeEnvironmentSettlement(tx, { companyId: previous.companyId, runId: previous.id });
       if (previous && previous.status !== status) await notifyUnsafeWorkspaceExportRunChange(tx, previous);
       if (previous && (previous.status === "scheduled_retry" || status === "scheduled_retry"))
         await notifyScheduledRetryCancellation(tx, { companyId: previous.companyId, runId: previous.id });

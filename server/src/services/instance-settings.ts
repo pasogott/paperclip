@@ -1,3 +1,5 @@
+import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
+import { notifyExternalAgentSettlement } from "../modules/external-agents/index.js";
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
 import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
 import { notifyNativeRunProjection } from "./native-run-projection-notifications.js";
@@ -627,6 +629,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.grokDispatch);
         if (patch.enableWorktreeRunExecution !== undefined) await notifyScheduledRetryCancellation(tx);
         if (patch.enableWorktreeRunExecution !== undefined) {
+          await notifyExternalAgentSettlement(tx);
           await notifyInstructionCommit(tx);
           await notifyDirectoryCleanup(tx);
           await notifyInstructionCollection(tx);
@@ -634,6 +637,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
           await notifyExternalConversationSettlement(tx);
           await notifyNativeRecoveryNotices(tx);
           await notifyNativeRunProjection(tx);
+          await notifyNativeEnvironmentSettlement(tx);
           await notifyNativeResultCommit(tx);
           await notifyNativeWorkspaceFinalization(tx);
         }
