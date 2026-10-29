@@ -1,10 +1,14 @@
-import { dismissAutomaticCompletionReviews } from "../services/native-runtime/automatic-completion-reviews.js";
+import { NativeRunCoordinatorStore } from "../services/native-runtime/native-run-coordinator-store.js";
+import { registerNativePendingEffectWork } from "../services/native-runtime/native-pending-effect-work.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { idleWorkSnapshot } from "../services/task-admission.js";
+import { dismissAutomaticCompletionReviews, registerAutomaticCompletionReviewWork } from "../services/native-runtime/automatic-completion-reviews.js";
 import * as childCompletionDelivery from "../services/native-runtime/native-child-completion-delivery.js";
 import { nativeCompletionFeedback } from "../services/native-runtime/native-completion-feedback.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   agents,
@@ -67,10 +71,11 @@ import {
   resolveNativeReconciliationStatus,
 } from "../services/native-runtime/native-finalization-reconciler.js";
 import * as activityLog from "../services/activity-log.js";
-import { dismissObsoleteNativePolicyReviews } from "../services/native-runtime/obsolete-policy-reviews.js";
+import { dismissObsoleteNativePolicyReviews, registerObsoletePolicyReviewWork } from "../services/native-runtime/obsolete-policy-reviews.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
 type Fixture = {
   id: string;
@@ -381,10 +386,11 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
   const outsideAgentId = randomUUID();
 
   beforeAll(async () => {
-    temporary = await startEmbeddedPostgresTestDatabase("paperclip-status-corpus-");
-    db = createDb(temporary.connectionString);
-    await db.insert(companies).values({ id: companyId, name: "Status corpus", issuePrefix: "PSC" });
-    await db.insert(companies).values({ id: outsideCompanyId, name: "Outside corpus", issuePrefix: "OUT" });
+    const external = resolveExternalTestDatabaseUrl("PAPERCLIP_STATUS_CORPUS_TEST_DATABASE_URL");
+    if (!external) temporary = await startEmbeddedPostgresTestDatabase("paperclip-status-corpus-");
+    db = createDb(external ?? temporary!.connectionString);
+    await db.insert(companies).values({ id: companyId, name: "Status corpus", issuePrefix: `PSC${companyId.replaceAll("-", "").toUpperCase()}` });
+    await db.insert(companies).values({ id: outsideCompanyId, name: "Outside corpus", issuePrefix: `OUT${outsideCompanyId.replaceAll("-", "").toUpperCase()}` });
     await db.insert(agents).values([
       {
         id: agentId,
@@ -411,9 +417,10 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     ]);
   }, 30_000);
 
-  afterAll(async () => temporary?.cleanup());
+  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temporary?.cleanup(); });
 
-  async function seedFixture(fixture: Fixture) {
+  async function seedFixture(fixture: Fixture, tenant = { companyId, agentId }) {
+    const { companyId, agentId } = tenant;
     const issueId = randomUUID();
     const runId = randomUUID();
     const contractId = randomUUID();
@@ -2007,7 +2014,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       .rejects.toThrow("native_pending_effect_target_missing:enqueue_continuation");
   }, 30_000);
 
-  async function seedPolicyReview(options: { genuine?: boolean; priorStatus?: "in_progress" | "blocked" | "in_review" } = {}) {
+  async function seedPolicyReview(options: { genuine?: boolean; priorStatus?: "in_progress" | "blocked" | "in_review"; commit?: typeof commitNativeStatusDecision } = {}) {
     const template = corpus.fixtures.find((candidate) => candidate.mode === "native")!;
     const priorStatus = options.priorStatus ?? "in_progress";
     const seeded = await seedFixture({
@@ -2022,7 +2029,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     });
     await db.update(workAssessments).set({ supersedesAssessmentId: previousAssessmentId })
       .where(eq(workAssessments.id, seeded.assessmentId));
-    const committed = await commitNativeStatusDecision({
+    const committed = await (options.commit ?? commitNativeStatusDecision)({
       db, companyId, issueId: seeded.issueId, runId: seeded.runId,
       assessmentId: seeded.assessmentId, priorStatus, priorStatusVersion: 0, priorDecisionId: null,
       decision: {
@@ -2044,6 +2051,387 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     });
     return { ...seeded, decision: decision!, interaction: interaction! };
   }
+
+
+  describe("native pending-effect scheduling", () => {
+    let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    let admitted = true;
+    const errors: unknown[] = [];
+    beforeEach(async () => {
+      await db.update(statusDecisionEffects).set({ deliveryState: "delivered" }).where(eq(statusDecisionEffects.companyId, companyId));
+      admitted = true; errors.length = 0;
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    });
+    afterEach(async () => {
+      await coordinator?.stop(); coordinator = undefined;
+      vi.useRealTimers(); vi.restoreAllMocks(); expect(errors).toEqual([]);
+    });
+    async function seedEffects(state = "pending", tenant = { companyId, agentId }) {
+      const { companyId } = tenant;
+      const template = corpus.fixtures.find(candidate => candidate.mode === "native")!;
+      const f = await seedFixture({ ...template, id: `pending-effects-${randomUUID()}`,
+        given: { ...template.given, priorIssueStatus: "in_progress", completionState: "pending_effect_recovery" } }, tenant);
+      const commitInput: Parameters<typeof commitNativeStatusDecision>[0] = { db, companyId, issueId: f.issueId, runId: f.runId,
+        assessmentId: f.assessmentId, priorStatus: "in_progress", priorStatusVersion: 0, priorDecisionId: null,
+        decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "preserve", toStatus: "in_progress",
+          reasonCode: "live_continuation_registered", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] } };
+      const committed = await commitNativeStatusDecision(commitInput);
+      const [effect] = await db.update(statusDecisionEffects).set({ deliveryState: state })
+        .where(eq(statusDecisionEffects.decisionId, committed.decision.id)).returning();
+      return { ...f, decisionId: committed.decision.id, effect, commitInput };
+    }
+    async function start() {
+      coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, canReconcile: () => admitted,
+        onError: error => errors.push(error) });
+      await registerNativePendingEffectWork(db, coordinator, () => admitted).ready;
+    }
+    async function flush() {
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(idleWorkSnapshot().active).toBe(0); expect(coordinator!.nextWakeAt()).toBeNull();
+      }, { timeout: 15_000 });
+    }
+    async function quiet(milliseconds = 120_000) {
+      const read = vi.spyOn(db, "select"), write = vi.spyOn(db, "transaction");
+      try { await vi.advanceTimersByTimeAsync(milliseconds); expect(read).not.toHaveBeenCalled(); expect(write).not.toHaveBeenCalled(); }
+      finally { read.mockRestore(); write.mockRestore(); }
+    }
+    const effect = async (id: string) => (await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.id, id)))[0];
+    it.each(["empty", "delivered"])("stays quiet with %s history", async state => {
+      if (state === "delivered") await seedEffects(state);
+      await start(); await flush(); await quiet();
+    });
+    it.each(["pending", "failed"])("recovers %s effects without materializing another target or decision", async state => {
+      const f = await seedEffects(state);
+      await start(); await flush();
+      expect(await effect(f.effect.id)).toMatchObject({ deliveryState: "delivered", attemptCount: f.effect.attemptCount + 1 });
+      expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, f.issueId))).toHaveLength(1);
+      expect(await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.issueId, f.issueId))).toHaveLength(1);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_progress");
+      await quiet();
+    });
+    it("leaves terminal-failure history dormant", async () => {
+      const f = await seedEffects();
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); await flush(); expect((await effect(f.effect.id)).deliveryState).toBe("pending"); await quiet();
+    });
+    it.each(["retry", "lease", "empty lease owner"])("honors the saved %s deadline without polling before it", async kind => {
+      const f = await seedEffects(); const due = new Date(Date.now() + 180_000);
+      await db.update(nativeRunFinalizations).set(kind === "retry" ? { nextAttemptAt: due } : { leaseOwner: kind === "empty lease owner" ? "" : "current-owner", leaseExpiresAt: due })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); expect(coordinator!.nextWakeAt()).toBe(due.getTime());
+      await quiet(120_000); expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+      await vi.advanceTimersByTimeAsync(60_000); await flush();
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it.each([["retry", 180_000], ["lease", 180_000], ["retry", 10_000]] as const)("rechecks a concurrent %s extension of %i ms under the coordinator lock", async (kind, delay) => {
+      const f = await seedEffects();
+      const due = new Date(Date.now() + delay);
+      const original = db.transaction.bind(db);
+      const transaction = vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+        await db.update(nativeRunFinalizations).set(kind === "retry"
+          ? { nextAttemptAt: due } : { leaseOwner: "new-owner", leaseExpiresAt: due })
+          .where(eq(nativeRunFinalizations.runId, f.runId));
+        return original(callback, config);
+      });
+      await start();
+      await vi.waitFor(() => expect(coordinator!.nextWakeAt()).toBe(due.getTime()));
+      transaction.mockRestore();
+      expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+      await quiet(delay / 2);
+      await vi.advanceTimersByTimeAsync(delay / 2); await flush();
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it("leaves pending effects to their owner during periodic finalization and preserves explicit recovery", async () => {
+      const f = await seedEffects();
+      expect(await reconcileNativeFinalizations(db, [f.runId], { skipNativePendingEffects: true })).toEqual([]);
+      expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+      expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, f.issueId))).toHaveLength(1);
+      await reconcileNativeFinalizations(db, [f.runId]);
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered");
+      expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, f.issueId))).toHaveLength(1);
+    });
+    it("limits a committed run wake to its owner and recovers other durable work on restart", async () => {
+      const local = await seedEffects();
+      const other = await seedEffects("pending", { companyId: outsideCompanyId, agentId: outsideAgentId });
+      for (const f of [local, other]) await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); await flush();
+      await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, other.runId));
+      await commitNativeStatusDecision(local.commitInput); await flush();
+      expect((await effect(local.effect.id)).deliveryState).toBe("delivered");
+      expect((await effect(other.effect.id)).deliveryState).toBe("pending"); await quiet();
+      await coordinator!.stop(); coordinator = undefined;
+      await start(); await flush();
+      expect((await effect(other.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it("drains more than one discovery page and stops querying delivered history", async () => {
+      const fixtures = [];
+      for (let index = 0; index < 103; index++) fixtures.push(await seedEffects());
+      await start(); await flush();
+      for (const f of fixtures) expect((await effect(f.effect.id)).deliveryState).toBe("delivered");
+      await quiet();
+    }, 60_000);
+    it("preserves failed target verification and retries only that obligation", async () => {
+      const f = await seedEffects();
+      await db.update(statusDecisionEffects).set({ targetId: randomUUID() }).where(eq(statusDecisionEffects.id, f.effect.id));
+      await start(); await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
+      expect((await effect(f.effect.id)).deliveryState).toBe("pending"); errors.length = 0;
+      await db.update(statusDecisionEffects).set({ targetId: f.effect.targetId }).where(eq(statusDecisionEffects.id, f.effect.id));
+      await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it("reactivates dormant history when the real decision replay restores its binding", async () => {
+      const f = await seedEffects();
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); await flush(); await quiet();
+      expect((await commitNativeStatusDecision(f.commitInput)).replayed).toBe(true);
+      await flush(); expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it.each(["commit", "rollback"] as const)("defers decision reactivation until the outer transaction %s", async outcome => {
+      const f = await seedEffects();
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); await flush();
+      const writing = db.transaction(async tx => {
+        await commitNativeStatusDecision({ ...f.commitInput, db: tx as unknown as typeof db });
+        await vi.advanceTimersByTimeAsync(1000);
+        expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+        if (outcome === "rollback") throw new Error("roll back decision replay");
+      });
+      if (outcome === "rollback") await expect(writing).rejects.toThrow("roll back decision replay");
+      else await writing;
+      await flush(); expect((await effect(f.effect.id)).deliveryState).toBe(outcome === "rollback" ? "pending" : "delivered"); await quiet();
+    });
+    it.each(["releases", "shortens"])("moves a future ownership deadline earlier when the real store %s its lease", async change => {
+      const f = await seedEffects();
+      const due = new Date(Date.now() + 300_000);
+      await db.update(nativeRunFinalizations).set({ leaseOwner: "release-owner", leaseExpiresAt: due }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); expect(coordinator!.nextWakeAt()).toBe(due.getTime()); await quiet();
+      const store = new NativeRunCoordinatorStore(db, { companyId, issueId: f.issueId, runId: f.runId, agentId,
+        normalizedSessionId: "pending-effects", runnerSourceInstanceId: "pending-effects", completionContractId: f.contractId!,
+        completionContractSha256: "test", completionContractRevision: "test", completionContractCriterionIds: [] });
+      if (change === "shortens") await store.claimFinalization({ leaseOwner: "release-owner", leaseTtlMs: 1000 });
+      else await store.markFinalizationRetry({ leaseOwner: "release-owner", failureCode: "temporary_failure", retryAfterMs: 1000 });
+      await flush(); expect(Date.now()).toBeLessThan(due.getTime());
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it("retains a first reactivation arriving during drain without passive reads", async () => {
+      const f = await seedEffects();
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await start(); await flush(); admitted = false;
+      await commitNativeStatusDecision(f.commitInput); await quiet();
+      expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+      admitted = true; await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+    it("retains startup work through drain and reconstructs an owed retry after shutdown", async () => {
+      const f = await seedEffects(); admitted = false;
+      await start(); await quiet(); expect((await effect(f.effect.id)).deliveryState).toBe("pending");
+      await coordinator!.stop(); coordinator = undefined;
+      admitted = true; await start(); await flush();
+      expect((await effect(f.effect.id)).deliveryState).toBe("delivered"); await quiet();
+    });
+  });
+
+  describe.each(["obsolete policy", "automatic completion"] as const)("%s review scheduling", kind => {
+    let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    let admitted = true;
+    const errors: unknown[] = [];
+    beforeEach(() => {
+      admitted = true; errors.length = 0;
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    });
+    afterEach(async () => {
+      await coordinator?.stop(); coordinator = undefined;
+      vi.useRealTimers(); vi.restoreAllMocks();
+      if (kind === "obsolete policy") await dismissObsoleteNativePolicyReviews(db);
+      else await dismissAutomaticCompletionReviews(db);
+      expect(errors).toEqual([]);
+    });
+    async function seedReview(options: Parameters<typeof seedPolicyReview>[0] = {}) {
+      if (kind === "obsolete policy" || options.genuine) return seedPolicyReview(options);
+      return seedPolicyReview({ ...options, commit: async input => {
+        const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, input.assessmentId));
+        await db.update(completionContracts).set({ risk: "low", completionAuthority: "agent_claim_policy" })
+          .where(eq(completionContracts.id, assessment!.contractId));
+        await db.update(workAssessments).set({ assessmentJson: { ...assessment!.assessmentJson, attentionRequests: [] } })
+          .where(eq(workAssessments.id, input.assessmentId));
+        return (options.commit ?? commitNativeStatusDecision)({ ...input, decision: { ...input.decision,
+          reasonCode: "completion_claim_incomplete", effects: [{ kind: "bind_reviewer", ownerUserId: null,
+            prompt: "Review the persisted native-run evidence and confirm whether this issue may be completed." }],
+        } });
+      } });
+    }
+    async function start() {
+      coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, canReconcile: () => admitted,
+        onError: error => errors.push(error) });
+      const register = kind === "obsolete policy" ? registerObsoletePolicyReviewWork : registerAutomaticCompletionReviewWork;
+      await register(db, coordinator, () => admitted).ready;
+    }
+    async function flush() {
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(idleWorkSnapshot().active).toBe(0);
+        expect(coordinator!.nextWakeAt()).toBeNull();
+      }, { timeout: 15_000 });
+    }
+    async function quiet() {
+      const read = vi.spyOn(db, "select"), write = vi.spyOn(db, "transaction");
+      try { await vi.advanceTimersByTimeAsync(120_000); expect(read).not.toHaveBeenCalled(); expect(write).not.toHaveBeenCalled(); }
+      finally { read.mockRestore(); write.mockRestore(); }
+    }
+    const card = async (id: string) => (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, id)))[0];
+    function gate() {
+      let release!: () => void;
+      const promise = new Promise<void>(resolve => { release = resolve; });
+      return { promise, release };
+    }
+
+    it("leaves genuine pending reviews and completed history quiet", async () => {
+      const genuine = await seedReview({ genuine: true });
+      const settled = await seedReview();
+      if (kind === "obsolete policy") await dismissObsoleteNativePolicyReviews(db, [settled.runId]);
+      else await dismissAutomaticCompletionReviews(db, settled.issueId);
+      await start(); await flush();
+      expect((await card(genuine.interaction.id)).status).toBe("pending");
+      expect((await card(settled.interaction.id)).status).toBe("cancelled");
+      await quiet();
+    });
+
+    it("wakes from the real decision commit after becoming idle and preserves decision history", async () => {
+      await start(); await flush(); await quiet();
+      const created = await seedReview();
+      await flush();
+      expect((await card(created.interaction.id)).status).toBe("cancelled");
+      expect((await issueService(db).getById(created.issueId))!.status).toBe(kind === "obsolete policy" ? "in_progress" : "in_review");
+      expect((await db.select().from(statusDecisions).where(eq(statusDecisions.id, created.decision.id)))[0]).toEqual(created.decision);
+      await quiet();
+    });
+
+    it.each(["commit", "rollback"] as const)("waits for the outer transaction to %s", async outcome => {
+      await start(); await flush();
+      const entered = gate(), release = gate();
+      let issueId = "";
+      const creating = seedReview({ commit: async input => db.transaction(async tx => {
+        issueId = input.issueId;
+        const result = await commitNativeStatusDecision({ ...input, db: tx as unknown as typeof db });
+        entered.release(); await release.promise;
+        if (outcome === "rollback") throw new Error("rollback obsolete review");
+        return result;
+      }) });
+      const settled = creating.then(value => ({ value, error: null }), error => ({ value: null, error }));
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toEqual([]);
+      release.release(); const result = await settled;
+      await flush();
+      if (outcome === "rollback") {
+        expect(result.error).toMatchObject({ message: "rollback obsolete review" });
+        expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toEqual([]);
+      } else {
+        expect(result.error).toBeNull();
+        expect((await card(result.value!.interaction.id)).status).toBe("cancelled");
+      }
+      await quiet();
+    });
+
+    it.each(["restart", "drain", "standby"] as const)("recovers committed cards after %s", async mode => {
+      if (mode !== "restart") { await start(); await flush(); admitted = false; }
+      const created = await seedReview();
+      if (mode === "restart") await start();
+      else {
+        await vi.advanceTimersByTimeAsync(1000);
+        expect((await card(created.interaction.id)).status).toBe("pending");
+        await quiet(); admitted = true;
+        await vi.advanceTimersByTimeAsync(30_000);
+      }
+      await flush(); expect((await card(created.interaction.id)).status).toBe("cancelled"); await quiet();
+    });
+
+    it("retains startup discovery while admission is closed", async () => {
+      const created = await seedReview(); admitted = false;
+      await start(); await quiet(); expect((await card(created.interaction.id)).status).toBe("pending");
+      admitted = true; await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect((await card(created.interaction.id)).status).toBe("cancelled"); await quiet();
+    });
+
+    it("retries only a failed cleanup while another candidate settles", async () => {
+      const first = await seedReview(), second = await seedReview();
+      const write = vi.spyOn(db, "transaction").mockRejectedValueOnce(new Error("injected obsolete cleanup failure"));
+      await start();
+      await vi.waitFor(async () => {
+        const states = [(await card(first.interaction.id)).status, (await card(second.interaction.id)).status];
+        expect(states.sort()).toEqual(["cancelled", "pending"]);
+      });
+      write.mockRestore(); expect(coordinator!.nextWakeAt()).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect([(await card(first.interaction.id)).status, (await card(second.interaction.id)).status].sort()).toEqual(["cancelled", "pending"]);
+      admitted = false; await quiet(); admitted = true;
+      await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect((await card(first.interaction.id)).status).toBe("cancelled");
+      expect((await card(second.interaction.id)).status).toBe("cancelled"); await quiet();
+    });
+
+    it("does not withdraw a review edited after discovery", async () => {
+      const created = await seedReview();
+      const original = db.transaction.bind(db);
+      const write = vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+        await db.update(issueThreadInteractions).set({ payload: { ...created.interaction.payload, prompt: "Approve this deployment." } })
+          .where(eq(issueThreadInteractions.id, created.interaction.id));
+        return original(callback, config);
+      });
+      await start(); await flush(); write.mockRestore();
+      expect((await card(created.interaction.id)).status).toBe("pending");
+      expect((await issueService(db).getById(created.issueId))!.status).toBe("in_review"); await quiet();
+    });
+
+    it("joins admitted cleanup on shutdown and reconstructs quiet state on restart", async () => {
+      const created = await seedReview(), entered = gate(), release = gate();
+      const original = db.transaction.bind(db);
+      const write = vi.spyOn(db, "transaction").mockImplementationOnce((callback, config) => original(async tx => {
+        entered.release(); await release.promise; return callback(tx);
+      }, config));
+      const starting = start(); await entered.promise;
+      let stopped = false; const stopping = coordinator!.stop().then(() => { stopped = true; });
+      await vi.advanceTimersByTimeAsync(1000); expect(stopped).toBe(false);
+      release.release(); await starting; await stopping; write.mockRestore();
+      expect((await card(created.interaction.id)).status).toBe("cancelled");
+      await start(); await flush(); await quiet();
+    });
+
+
+    it("retains discovery after a database error and retries on resume", async () => {
+      const created = await seedReview();
+      const read = vi.spyOn(db, "select").mockImplementationOnce(() => { throw new Error("injected review discovery failure"); });
+      await start();
+      await vi.waitFor(() => expect(errors.length).toBeGreaterThan(0));
+      read.mockRestore(); expect(coordinator!.nextWakeAt()).not.toBeNull();
+      expect((await card(created.interaction.id)).status).toBe("pending");
+      errors.length = 0; admitted = false; await quiet(); admitted = true;
+      await vi.advanceTimersByTimeAsync(30_000); await flush();
+      expect((await card(created.interaction.id)).status).toBe("cancelled"); await quiet();
+    });
+
+    it("preserves a newly answered card between discovery and withdrawal", async () => {
+      const created = await seedReview();
+      const original = db.transaction.bind(db);
+      const write = vi.spyOn(db, "transaction").mockImplementationOnce(async (callback, config) => {
+        await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, created.interaction.id));
+        return original(callback, config);
+      });
+      await start(); await flush(); write.mockRestore();
+      expect((await card(created.interaction.id)).status).toBe("accepted");
+      expect((await issueService(db).getById(created.issueId))!.status).toBe("in_review"); await quiet();
+    });
+
+    it("drains more than one reconstruction page without replaying settled reviews", async () => {
+      const created = [];
+      for (let index = 0; index < 103; index++) created.push(await seedReview());
+      await start(); await flush();
+      for (const value of created) expect((await card(value.interaction.id)).status).toBe("cancelled");
+      await quiet();
+    }, 60_000);
+  });
 
   async function seedAutomaticReview() {
     const seeded = await seedPolicyReview();

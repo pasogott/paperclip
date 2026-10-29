@@ -1,3 +1,7 @@
+import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-workspace-export-notifications.js";
+import { notifyCancelledWorkspacePreservation } from "../../../services/cancelled-workspace-preservation-notifications.js";
+import { notifyInstructionCollection } from "../../../services/instruction-collection-notifications.js";
+import { notifyChatInboundWakeNotices } from "../../../services/chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -94,6 +98,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
     },
 
     async cancelWake({ wakeId, reason, now }) {
+      await notifyChatInboundWakeNotices(tx, { companyId, issueId });
       await tx
         .update(agentWakeupRequests)
         .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
@@ -101,6 +106,9 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
     },
 
     async cancelQueueRun({ queueRunId, reason, now }) {
+      await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
+      await notifyInstructionCollection(tx, { companyId, runId: queueRunId });
+      await notifyCancelledWorkspacePreservation(tx, { companyId, runId: queueRunId });
       await notifyChatRunMilestones(tx, { companyId, issueId });
       const row = await tx
         .update(heartbeatRuns)
@@ -112,6 +120,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
     },
 
     async clearExecutionLockAndTouchIssue({ issueId, executionRunId, updatedAt }) {
+      await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
       await tx
         .update(issues)
         .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt })

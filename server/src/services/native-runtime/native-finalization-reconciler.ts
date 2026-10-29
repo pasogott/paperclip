@@ -1,3 +1,8 @@
+import { pendingNativeStatusEffectsCondition } from "./native-pending-effect-work.js";
+import { notifyUnsafeWorkspaceExportRunChange } from "../unsafe-workspace-export-notifications.js";
+import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
+import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
+import { readRequiredQualityReview } from "../required-quality-review.js";
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
@@ -63,6 +68,7 @@ import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../recovery/pause-hold-guard.js";
 import { readRunCancellation } from "../run-cancellation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { retireSupersededNativeRetry } from "./native-superseded-retry.js";
 
 export type NativeReconciliationFacts = {
   equivalentAttentionFamily?: boolean;
@@ -392,7 +398,7 @@ export async function claimNativeSessionResumptions(input: {
       const [issue] = await tx.select().from(issues).where(and(
         eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.issueId),
       )).for("update").limit(1);
-      if (!issue || !["todo", "in_progress", "in_review"].includes(issue.status)) return false;
+      if (!issue) return false;
       const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
         eq(nativeRunFinalizations.companyId, candidate.companyId), eq(nativeRunFinalizations.runId, candidate.runId),
         eq(nativeRunFinalizations.issueId, issue.id),
@@ -402,6 +408,10 @@ export async function claimNativeSessionResumptions(input: {
         eq(heartbeatRuns.nativeIssueId, issue.id),
       )).for("update").limit(1);
       if (!run || !coordinator) return false;
+      if (await retireSupersededNativeRetry(tx as unknown as Db, {
+        run, coordinator, issueExecutionRunId: issue.executionRunId, now,
+      })) return false;
+      if (!["todo", "in_progress", "in_review"].includes(issue.status)) return false;
       const row = { run, coordinator };
       if (
         row.run.runtimeMode !== "native" ||
@@ -509,6 +519,9 @@ export async function claimNativeSessionResumptions(input: {
           nextAttemptAt: null,
           updatedAt: now,
         }).where(eq(nativeRunFinalizations.runId, row.run.id));
+        await notifyInstructionCollection(tx, { companyId: row.run.companyId, runId: row.run.id });
+        await notifyCancelledWorkspacePreservation(tx, { companyId: row.run.companyId, runId: row.run.id });
+        await notifyUnsafeWorkspaceExportRunChange(tx, row.run);
         const [updatedRun] = await tx.update(heartbeatRuns).set({
           status: "failed",
           finishedAt: now,
@@ -627,6 +640,12 @@ export async function claimNativeSessionResumptions(input: {
 }
 
 type NativeReconciliationOptions = {
+  skipObsoletePolicyReviews?: boolean;
+  skipAutomaticCompletionReviews?: boolean;
+  skipUnsafeWorkspaceExports?: boolean;
+  skipNativePendingEffects?: boolean;
+  skipNativeResponsePresentation?: boolean;
+  skipNativeReviewResponse?: boolean;
   pluginWorkerManager?: WorkspaceWorkers;
   environmentRuntime?: EnvironmentRuntimeService;
   onWorkspaceSettled?: (input: {
@@ -709,21 +728,27 @@ async function reconcileNativeFinalizationsPass(
   options: NativeReconciliationOptions,
   timing: NativeReconciliationPassTiming,
 ) {
-  timing.phase("legacy_workspace_exports");
-  await recoverLegacyUnsafeWorkspaceExports(db, runIds).catch((err) => {
-    logger.warn({ err }, "Historical unsafe export recovery remains pending");
-  });
-  timing.phase("obsolete_policy_reviews");
-  await dismissObsoleteNativePolicyReviews(db, runIds).catch((err) => {
-    logger.warn({ err }, "Obsolete native policy review lookup failed; continuing native reconciliation");
-  });
-  timing.phase("automatic_completion_reviews");
-  if (runIds?.length) {
-    const scopes = await db.select({ issueId: nativeRunFinalizations.issueId }).from(nativeRunFinalizations)
-      .where(inArray(nativeRunFinalizations.runId, runIds));
-    for (const scope of scopes) await dismissAutomaticCompletionReviews(db, scope.issueId);
-  } else {
-    await dismissAutomaticCompletionReviews(db);
+  if (!options.skipUnsafeWorkspaceExports) {
+    timing.phase("legacy_workspace_exports");
+    await recoverLegacyUnsafeWorkspaceExports(db, runIds).catch((err) => {
+      logger.warn({ err }, "Historical unsafe export recovery remains pending");
+    });
+  }
+  if (!options.skipObsoletePolicyReviews) {
+    timing.phase("obsolete_policy_reviews");
+    await dismissObsoleteNativePolicyReviews(db, runIds).catch((err) => {
+      logger.warn({ err }, "Obsolete native policy review lookup failed; continuing native reconciliation");
+    });
+  }
+  if (!options.skipAutomaticCompletionReviews) {
+    timing.phase("automatic_completion_reviews");
+    if (runIds?.length) {
+      const scopes = await db.select({ issueId: nativeRunFinalizations.issueId }).from(nativeRunFinalizations)
+        .where(inArray(nativeRunFinalizations.runId, runIds));
+      for (const scope of scopes) await dismissAutomaticCompletionReviews(db, scope.issueId);
+    } else {
+      await dismissAutomaticCompletionReviews(db);
+    }
   }
   timing.phase("candidate_scan");
   const now = new Date();
@@ -755,6 +780,7 @@ async function reconcileNativeFinalizationsPass(
       eq(heartbeatRuns.runtimeMode, "native"),
       isNotNull(nativeRunFinalizations.resultId),
       notInArray(nativeRunFinalizations.phase, ["terminal_failure"]),
+      options.skipNativePendingEffects ? not(pendingNativeStatusEffectsCondition(db)) : undefined,
       or(
         isNull(nativeRunFinalizations.nextAttemptAt),
         lte(nativeRunFinalizations.nextAttemptAt, new Date()),
@@ -784,6 +810,7 @@ async function reconcileNativeFinalizationsPass(
         ))
       : [];
     if (row.decisionId && pendingEffects.length > 0) {
+      if (options.skipNativePendingEffects) continue;
       const decision = resolveNativeReconciliationStatus({
         facts: { undeliveredEffectCount: pendingEffects.length },
         priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus,
@@ -836,7 +863,7 @@ async function reconcileNativeFinalizationsPass(
           )).limit(1).then((entries) => entries[0] ?? null)
         : null;
       const currentDecisionJson = record(currentDecision?.decisionJson);
-      if (row.coordinatorPhase === "committed") {
+      if (row.coordinatorPhase === "committed" && !options.skipNativeResponsePresentation) {
         // A later decision can supersede this run's task status, but cannot
         // erase its accepted, still-authorized response. Repair presentation
         // before the status-only early return below, without rerunning work.
@@ -849,7 +876,8 @@ async function reconcileNativeFinalizationsPass(
         row.decisionId &&
         row.resultId &&
         row.assessmentId &&
-        currentDecisionJson.externalChatReviewPresentation
+        currentDecisionJson.externalChatReviewPresentation &&
+        !options.skipNativeReviewResponse
       ) {
         // A later chat turn may retain the same pending review. Recover the
         // earlier response independently before status reconciliation skips
@@ -975,9 +1003,11 @@ async function reconcileNativeFinalizationsPass(
           assessment: reassessment,
           supersedesAssessmentId: assessment.id,
         });
-        const decision = retiredAutomaticReview && currentIssue
+        const qualityReview = currentIssue ? await readRequiredQualityReview(db, currentIssue) : null;
+        let decision = retiredAutomaticReview && currentIssue
           ? resolveNativeFinalizerStatus({
               hasPendingChildCompletion,
+              requiredQualityReviewSatisfied: qualityReview?.satisfied,
               assessment: reassessment, terminalState: "succeeded", workspaceFinalizeStatus: "succeeded",
               governanceGate: await pendingNativeGovernance({ db, companyId: row.companyId, issueId: row.issueId,
                 runId: row.runId, executionState: record(currentIssue.executionState) }),
@@ -990,6 +1020,10 @@ async function reconcileNativeFinalizationsPass(
               facts: { ...facts, hasPendingChildCompletion },
               priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus, agentId: row.agentId,
             });
+        if (decision.statusAction === "done" && qualityReview?.satisfied === false) {
+          decision = resolveNativeFinalizerStatus({ assessment: reassessment, terminalState: "succeeded", workspaceFinalizeStatus: "succeeded",
+            requiredQualityReviewSatisfied: false, priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus, agentId: row.agentId });
+        }
         let committed: Awaited<ReturnType<typeof commitNativeStatusDecision>>;
         try {
           committed = await commitNativeStatusDecision({
@@ -1092,6 +1126,8 @@ async function reconcileNativeFinalizationsPass(
           runId: row.runId,
           workspaceFinalizeStatus,
           projectRunStatus: true,
+          skipNativeResponsePresentation: options.skipNativeResponsePresentation,
+          skipNativeReviewResponse: options.skipNativeReviewResponse,
           preserveProviderAttempt: Boolean(
             readNativeWorkspaceSyncReference(
               row.nativeWorkspaceSync,
@@ -1150,6 +1186,8 @@ async function reconcileNativeFinalizationsPass(
         runId: row.runId,
         workspaceFinalizeStatus: barrier.status as "succeeded" | "failed",
         projectRunStatus: true,
+        skipNativeResponsePresentation: options.skipNativeResponsePresentation,
+        skipNativeReviewResponse: options.skipNativeReviewResponse,
         preserveProviderAttempt: Boolean(
           readNativeWorkspaceSyncReference(
             row.nativeWorkspaceSync,

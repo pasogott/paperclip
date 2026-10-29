@@ -1,3 +1,7 @@
+import { notifyNativeFinalizationWork } from "./native-finalization-notifications.js";
+import { notifyUnsafeWorkspaceExportRunChange } from "./unsafe-workspace-export-notifications.js";
+import { notifyCancelledWorkspacePreservation } from "./cancelled-workspace-preservation-notifications.js";
+import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { randomUUID } from "node:crypto";
 import { logger } from "../middleware/logger.js";
@@ -143,6 +147,7 @@ export async function reconcileAbandonedExecutionControl(
           }
           // A persisted result belongs to the existing finalizer, not a replacement provider.
           if (coordinator?.resultId) {
+            await notifyNativeFinalizationWork(tx, { companyId: run.companyId, runId: run.id });
             await tx
               .update(nativeRunFinalizations)
               .set({
@@ -183,6 +188,9 @@ export async function reconcileAbandonedExecutionControl(
                 updatedAt: now,
               })
               .where(eq(nativeRunFinalizations.runId, run.id));
+          await notifyInstructionCollection(tx, { companyId: run.companyId, runId: run.id });
+          await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId: run.id });
+          await notifyUnsafeWorkspaceExportRunChange(tx, run);
           await notifyExecutionRunWork(tx);
           const [updatedRun] = await tx
             .update(heartbeatRuns)
