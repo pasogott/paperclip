@@ -1,3 +1,4 @@
+import { nativeStatusReassessmentWork } from "../../services/native-runtime/native-status-reassessment-work.js";
 import { nativeReviewResponseWork } from "../../services/native-runtime/native-review-response-work.js";
 import { nativeResponsePresentationWork } from "../../services/native-runtime/native-response-presentation-work.js";
 import { DELIVERY_QUEUES } from "../../services/delivery-work-notifications.js";
@@ -377,7 +378,7 @@ describe("iMessage Photon channel control plane", () => {
       },
     };
   }
-  it.each([DELIVERY_QUEUES.nativeResponsePresentation, DELIVERY_QUEUES.nativeReviewResponse])(
+  it.each([DELIVERY_QUEUES.nativeResponsePresentation, DELIVERY_QUEUES.nativeReviewResponse, DELIVERY_QUEUES.nativeStatusReassessment])(
     "keeps repeated active Photon ownership assertions out of %s reconstruction and wakes once on recovery", async queue => {
     const t = await setup();
     await t.start();
@@ -385,7 +386,8 @@ describe("iMessage Photon channel control plane", () => {
     const errors: unknown[] = [];
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
     coordinators.push(coordinator);
-    const work = queue === DELIVERY_QUEUES.nativeResponsePresentation ? nativeResponsePresentationWork(db) : nativeReviewResponseWork(db);
+    const work = queue === DELIVERY_QUEUES.nativeResponsePresentation ? nativeResponsePresentationWork(db)
+      : queue === DELIVERY_QUEUES.nativeReviewResponse ? nativeReviewResponseWork(db) : nativeStatusReassessmentWork(db);
     const worker = work.register(coordinator, () => true);
     const debug = db.$client.options.debug;
     const hints: unknown[] = [];

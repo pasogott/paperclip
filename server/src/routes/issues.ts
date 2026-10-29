@@ -1,3 +1,5 @@
+import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
+import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
 import { notifyChatInboundWakeNotices } from "../services/chat-inbound-wake-notice-notifications.js";
 import { completeIssueCommentReceipt } from "../services/issue-comment-receipt.js";
@@ -9932,6 +9934,7 @@ export function issueRoutes(
                 );
               }
               await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: lockedIssue.companyId, issueId: lockedIssue.id });
+              await notifyNativeRecoveryNotices(tx, { companyId: lockedIssue.companyId, issueId: lockedIssue.id });
               const [reopened] = await tx
                 .update(issueRecoveryActions)
                 .set({ status: "active", outcome: null, resolvedAt: null })
@@ -11816,6 +11819,7 @@ export function issueRoutes(
         promotedAt,
       });
       const product = await db.transaction(async (tx) => {
+        await notifyNativeStatusReassessment(tx, { companyId: issue.companyId, issueId: issue.id });
         const markPromoted = {
           sourceTrust: promotionTrust,
           updatedAt: promotedAt,

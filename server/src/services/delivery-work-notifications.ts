@@ -2,6 +2,13 @@ import { signalDatabaseWork, subscribeDatabaseWork } from "@paperclipai/db";
 
 /** Topics for existing durable queues; register intent before their writes. */
 export const DELIVERY_QUEUES = {
+  externalConversationSettlement: "external-conversation-settlement",
+  nativeRecoveryNotices: "native-recovery-notices",
+  nativeRunProjection: "native-run-projection",
+  nativeResultCommit: "native-result-commit",
+  nativeWorkspaceFinalization: "native-workspace-finalization",
+  retainedNativeSessionCleanup: "retained-native-session-cleanup",
+  nativeStatusReassessment: "native-status-reassessment",
   nativeReviewResponse: "native-review-response",
   nativeResponsePresentation: "native-response-presentation",
   nativePendingEffects: "native-pending-effects",

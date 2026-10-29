@@ -1,3 +1,4 @@
+import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -172,6 +173,9 @@ export async function terminalizeLegacyExecution(input: {
       ? retainedLeaseIds.length > 0 || hasRequiredWorkspaceRecovery(updated.resultJson)
       : !input.reconcileIfNeeded || await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, updated);
     if (!needsRecovery) return updated;
+    if (!input.recordRestoreFailureOnly && task && (task.executionRunId === run.id || task.checkoutRunId === run.id)) {
+      await notifyNativeStatusReassessment(tx, { companyId: task.companyId, issueId: task.id });
+    }
     if (!input.recordRestoreFailureOnly && task?.executionRunId === run.id)
       await tx
         .update(issues)

@@ -1224,7 +1224,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       expect(wakeRow?.payload).not.toHaveProperty("foo");
     });
 
-    it.each([DELIVERY_QUEUES.nativeResponsePresentation, DELIVERY_QUEUES.nativeReviewResponse])(
+    it.each([DELIVERY_QUEUES.nativeResponsePresentation, DELIVERY_QUEUES.nativeReviewResponse, DELIVERY_QUEUES.nativeStatusReassessment])(
       "scopes a real coalesced-input %s response wake to its active run after commit", async queue => {
       const companyId = await seedCompany();
       const agentId = await seedAgent({ companyId });
