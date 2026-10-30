@@ -93,6 +93,17 @@ bot is not a general-work fixture.
 The private provider supplies its exact execution identity through the `agent`
 capability and collects normalized run usage. The existing Cloud provider still
 owns authentication, conditional leases, fixture ownership, and cleanup.
+
+The Plan and Stop final-answer checks reload the owned task and bind its exact,
+unique visible reply to the final successful native run. A settled native turn
+can render its saved reply before the comments projection exists; that path also
+requires exactly one matching final assistant message in the complete durable
+event stream, with the same company, agent, run and validated PRP source. If the run
+has a projected selected completion comment, only that attributed comment can
+satisfy the check. A pending or suppressed comment can use the same proven native
+reply path. A finish summary by itself, an earlier turn, a progress
+bubble, or a cancelled run cannot satisfy it. Private receipts record the run,
+thread anchor and observed text; classic protocol comment matchers stay strict.
 A model allowance is an accounting threshold; reused direct-provider routes do
 not acquire the onboarding gateway's request-level cash guarantee. The question
 observer allows one run and waits at most four minutes. Cleanup stops only
