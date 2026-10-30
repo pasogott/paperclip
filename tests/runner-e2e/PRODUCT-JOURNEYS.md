@@ -41,7 +41,10 @@ reusing successful onboarding reports `onboarding`. Preconfigured state is never
 counted as onboarding coverage.
 
 The scripted onboarding request supplies a self-contained child brief. The
-parent must copy the full marked brief verbatim into `create_task.description`,
+parent must first save its proposal through the existing native confirmation
+tool and check the saved card receipt. The browser records the human decision;
+the parent must not record its own approval or treat the opening scope as acceptance.
+It must copy the full marked brief verbatim into `create_task.description`,
 including tool names, parameters, and the encoded input. It orders the child's
 work: create the files, publish `connection-proof.json` with that exact filename
 and workspace-relative content reference, save its Paperclip task document with
@@ -54,6 +57,9 @@ it does not retry the journey. The model still computes the result, publishes
 the file, saves the document, and completes the tasks. Independent download,
 math, provenance, document, and parent-link checks remain authoritative.
 Historical failed attempts retain their original fixture and outcome.
+The parent's final reply must use Markdown links to the saved child results,
+including the attachment's real content or download path. Naming a file or
+document key in inline code does not satisfy the existing parent-link check.
 
 Save this credential-free local target config outside the repository:
 
