@@ -1,3 +1,7 @@
+import { registerNativeHarnessBackupExpirationWork } from "./services/native-runtime/native-harness-backup-expiration-work.js";
+import { registerMergeConfirmationWork } from "./services/merged-pr-confirmation-work.js";
+import { registerRoutineExecutionStatusWork } from "./services/routine-execution-status-work.js";
+import { routineExecutionStatusService } from "./services/routine-run-status.js";
 import { attentionRetentionService, registerAttentionRetentionWork } from "./services/attention-retention.js";
 import { registerProviderTraceRetentionWork } from "./services/provider-trace-retention-work.js";
 import { registerRunEvidenceMigrationWork } from "./services/run-evidence-migration-work.js";
@@ -33,8 +37,6 @@ import {
   skillVersionRetentionService,
 } from "./services/skill-version-retention.js";
 import {
-  NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS,
-  NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS,
   nativeHarnessBackupExpirationService,
 } from "./services/native-runtime/native-harness-backup-expiration.js";
 import { registerNativeRunnerEvidenceRetentionWork } from "./services/native-runtime/native-runner-evidence-retention-work.js";
@@ -1290,47 +1292,10 @@ async function startServerWithDatabaseTeardown(
     evidenceRetentionDays: config.nativeRunnerEvidenceRetentionDays,
     shouldContinue: () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby(),
   });
-  let nativeHarnessBackupExpirationInFlight = false;
-  let nativeHarnessBackupExpirationContinuation: ReturnType<typeof setTimeout> | undefined;
-  const sweepNativeHarnessBackups = () => {
-    if (!config.nativeHarnessBackupExpirationEnabled || nativeHarnessBackupExpirationInFlight || isIdleTaskDrainActive() || heartbeatSchedulerStopped || isWarmStandby()) return;
-    nativeHarnessBackupExpirationInFlight = true;
-    trackHeartbeatSchedulerWork(nativeHarnessBackupExpiration.tick()
-      .then((result) => {
-        if (result.candidates > 0 || result.evidenceCandidates > 0 || result.failed > 0) {
-          logger.info({ ...result, dryRun: config.nativeHarnessBackupExpirationDryRun }, "native harness backup expiration");
-        }
-        if (result.truncated && !heartbeatSchedulerStopped) {
-          nativeHarnessBackupExpirationContinuation = setTimeout(sweepNativeHarnessBackups, 1000);
-          nativeHarnessBackupExpirationContinuation.unref?.();
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "native harness backup expiration failed");
-      })
-      .finally(() => { nativeHarnessBackupExpirationInFlight = false; }));
-  };
-  const nativeHarnessBackupExpirationInterval = setInterval(sweepNativeHarnessBackups, NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS);
-  nativeHarnessBackupExpirationInterval.unref?.();
-  const nativeHarnessBackupExpirationStartup = setTimeout(sweepNativeHarnessBackups, NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS);
-  nativeHarnessBackupExpirationStartup.unref?.();
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
   });
-  const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
-    if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
-    trackHeartbeatSchedulerWork(externalObjects
-      .refreshDueObjectsForActiveCompanies(50, now)
-      .then((result) => {
-        if (result.checked > 0 || result.refreshed > 0) {
-          logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "external-object scheduler tick failed");
-      }));
-  };
 
   // The retry backstop for orphan sandboxes. An acquire that rejects a
   // foreign-company insert tears the provisioned sandbox down. If that teardown
@@ -1357,8 +1322,16 @@ async function startServerWithDatabaseTeardown(
     resolveNativeQuestion: (interaction) => deliverNativeQuestionResponse(db as any, interaction),
   });
   const deliveryWork = app.locals.deliveryWork as ReturnType<typeof createDeliveryWorkCoordinator>;
+  externalObjects.registerRefreshWork(deliveryWork,
+    () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby());
   if (config.nativeHarnessBackupExpirationEnabled) {
     nativeHarnessBackupExpiration.registerCheckpointExpiration(deliveryWork);
+    const backupExpirationWork = registerNativeHarnessBackupExpirationWork(deliveryWork, db as any, {
+      dryRun: config.nativeHarnessBackupExpirationDryRun,
+      closedForDays: config.nativeHarnessBackupExpirationDays,
+    }, () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby());
+    trackHeartbeatSchedulerWork(backupExpirationWork.ready);
+    server.on("close", backupExpirationWork.stop);
   }
   const taskDrainExpiryWork = registerTaskDrainExpiryWork(deliveryWork, () => {
     if (heartbeatSchedulerStopped || isWarmStandby()) return;
@@ -1560,15 +1533,6 @@ async function startServerWithDatabaseTeardown(
       heartbeat.drainActiveRunExecutions();
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const routines = routineService(db as any, { pluginWorkerManager });
-    let nextRoutineStatusReconcile = 0;
-    const scheduleRoutineStatusReconcile = () => {
-      if (!isCloudManagedInstance() || isWarmStandby() || isIdleTaskDrainActive() || heartbeatSchedulerStopped ||
-          Date.now() < nextRoutineStatusReconcile) return;
-      nextRoutineStatusReconcile = Date.now() + 5 * 60_000;
-      trackHeartbeatSchedulerWork(routines.reconcileExecutionRunStatuses().then(result => {
-        if (result.settled > 0) logger.info(result, "reconciled routine execution issue status");
-      }).catch(() => logger.warn("routine execution status reconciliation deferred")));
-    };
     const statusCardEvaluation = statusCardEvaluationService(db as any, heartbeat);
     const issues = issueService(db as any);
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
@@ -1600,19 +1564,8 @@ async function startServerWithDatabaseTeardown(
         : config.workspaceCompactionDelayHours * 60 * 60 * 1000,
       terminalWorkspaceInspectionBackoffMs: TERMINAL_WORKSPACE_RETRY_MS,
     });
-    const scheduleMergedPullRequestConfirmationSweep = () => {
-      if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
-      trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
-        .sweepMergedPullRequestConfirmations()
-        .then((result) => {
-          if (result.accepted > 0) {
-            logger.info(result, "accepted merge confirmations for merged pull requests");
-          }
-        })
-        .catch((err) => {
-          logger.error({ err }, "merged pull-request confirmation sweep failed");
-        }));
-    };
+    registerMergeConfirmationWork(deliveryWork, mergedPullRequestConfirmations,
+      () => !isIdleTaskDrainActive() && !heartbeatSchedulerStopped && !isWarmStandby());
     const gitRestorePointWorker = registerGitRestorePointWork(deliveryWork, gitRestorePointRetentionService(db as any, {
       storage: storageService,
       retentionDays: config.gitRestorePointRetentionDays,
@@ -1941,7 +1894,6 @@ async function startServerWithDatabaseTeardown(
       // captures the authoritative set of running heartbeat rows.
       trackHeartbeatSchedulerWork((async () => {
         if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
-        scheduleRoutineStatusReconcile();
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -1951,10 +1903,8 @@ async function startServerWithDatabaseTeardown(
         }
 
         if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
-        scheduleExternalObjectRefreshSweep(new Date());
 
         if (isIdleTaskDrainActive() || heartbeatSchedulerStopped) return;
-        scheduleMergedPullRequestConfirmationSweep();
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
 
@@ -1982,6 +1932,11 @@ async function startServerWithDatabaseTeardown(
       }));
     };
     const startHeartbeatScheduler = () => {
+      if (isCloudManagedInstance()) {
+        const status = registerRoutineExecutionStatusWork(deliveryWork, routineExecutionStatusService(db as any),
+          () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped);
+        trackHeartbeatSchedulerWork(status.ready);
+      }
       const scheduled = registerScheduledWork(deliveryWork, {
         retryMs: config.heartbeatSchedulerIntervalMs,
         tickAgentTimers: async signal => {
@@ -2013,7 +1968,6 @@ async function startServerWithDatabaseTeardown(
     // as the enabled path.
     await startEnvironmentCleanup();
     startHeartbeatSchedulerInterval(() => {
-      scheduleExternalObjectRefreshSweep(new Date());
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
     });
@@ -2120,9 +2074,6 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     skillVersionRetentionWorker?.unsubscribe();
     await taskDrainExpiryWork.stop();
-    clearInterval(nativeHarnessBackupExpirationInterval);
-    clearTimeout(nativeHarnessBackupExpirationStartup);
-    clearTimeout(nativeHarnessBackupExpirationContinuation);
     nativeRunnerEvidenceRetentionWorker?.unsubscribe();
     await skillSourceSync.stop();
     unsubscribeChatCompletions();

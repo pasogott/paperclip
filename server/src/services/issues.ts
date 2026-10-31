@@ -1,3 +1,7 @@
+import { notifyNativeHarnessBackupExpiration } from "./native-harness-backup-expiration-notifications.js";
+import { notifyExternalObjectRefresh } from "./external-object-refresh-notifications.js";
+import { notifyMergeConfirmationWork } from "./merged-pr-confirmation-notifications.js";
+import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyIssueAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
@@ -94,6 +98,7 @@ import {
   heartbeatRuns,
   routineRuns,
   executionWorkspaces,
+  externalObjectMentions,
   issueApprovals,
   issueAccessGrants,
   issueAttachments,
@@ -10653,6 +10658,7 @@ export function issueService(db: Db) {
         values.id ??= randomUUID();
         await notifyIssueAttentionRetentionWork(tx, { companyId, issueId: values.id, parentId: values.parentId, originKind: values.originKind, originId: values.originId });
         await notifyStatusCardIssueChange(tx, companyId);
+        if (values.originKind === "routine_execution") await notifyRoutineExecutionStatus(tx, values.id, companyId);
         const [issue] = await tx.insert(issues).values(values).returning();
         await attachOwnedDraftImages(tx, issue, issue.description, { userId: issueData.createdByUserId, agentId: issueData.createdByAgentId });
         if (issue.visibility === "private" && !inheritedPrivateSubtree && issueData.createdByAgentId) {
@@ -11535,11 +11541,17 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        if (patch.status !== undefined || patch.completedAt !== undefined || patch.cancelledAt !== undefined) {
+          await notifyNativeHarnessBackupExpiration(tx, { companyId: receiptExisting.companyId, issueId: id });
+        }
         await notifyStatusCardIssueChange(tx, receiptExisting.companyId);
         if ((patch.status !== undefined && patch.status !== receiptExisting.status)
           || patch.completedAt !== undefined || patch.cancelledAt !== undefined
           || issueData.parentId !== undefined || issueData.executionWorkspaceId !== undefined) {
           await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
+        }
+        if (patch.status !== undefined || patch.hiddenAt !== undefined) {
+          await notifyMergeConfirmationWork(tx, { companyId: receiptExisting.companyId, issueId: id });
         }
         await notifyIssueAttentionRetentionWork(tx, { companyId: receiptExisting.companyId, issueId: id, parentId: patch.parentId, originKind: patch.originKind, originId: patch.originId });
         if (patch.status !== undefined || patch.assigneeAgentId !== undefined || patch.assigneeUserId !== undefined
@@ -11549,6 +11561,7 @@ export function issueService(db: Db) {
           await notifyRunDispatch(tx, { companyId: receiptExisting.companyId });
           await notifyDeferredExecutionEligibility(tx, { companyId: receiptExisting.companyId });
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+          await notifyRoutineExecutionStatus(tx, id);
         }
         if (patch.monitorNextCheckAt !== undefined || (receiptExisting.monitorNextCheckAt &&
           (patch.status !== undefined || patch.assigneeAgentId !== undefined || patch.assigneeUserId !== undefined))) {
@@ -11596,6 +11609,9 @@ export function issueService(db: Db) {
           await notifyNativeResultCommit(tx, { companyId: receiptExisting.companyId, issueId: id });
           await notifyNativeWorkspaceFinalization(tx, { companyId: receiptExisting.companyId, issueId: id });
           await notifyNativeStatusReassessment(tx, { companyId: receiptExisting.companyId, issueId: id });
+        }
+        if (patch.originKind !== undefined || patch.originRunId !== undefined || patch.originId !== undefined) {
+          await notifyRoutineExecutionStatus(tx, id);
         }
         const updated = await tx
           .update(issues)
@@ -12012,6 +12028,14 @@ export function issueService(db: Db) {
           if (owner) {
             await notifyIssueAttentionRetentionWork(tx, { companyId: owner.companyId, issueId: id });
             await notifyExternalConversationSettlement(tx, { companyId: owner.companyId });
+            const mentionedObjects = await tx.selectDistinct({ objectId: externalObjectMentions.objectId })
+              .from(externalObjectMentions)
+              .where(and(
+                eq(externalObjectMentions.companyId, owner.companyId),
+                eq(externalObjectMentions.sourceIssueId, id),
+                isNotNull(externalObjectMentions.objectId),
+              ));
+            for (const mention of mentionedObjects) await notifyExternalObjectRefresh(tx, owner.companyId, mention.objectId!);
             await notifyApprovalWork(tx, owner.companyId);
             await notifyStatusCardIssueChange(tx, owner.companyId);
           }
@@ -12020,6 +12044,7 @@ export function issueService(db: Db) {
           await notifyRunDispatch(tx, owner ? { companyId: owner.companyId } : undefined);
           if (owner) await notifyDeferredExecutionEligibility(tx, owner);
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+          await notifyRoutineExecutionStatus(tx, id);
           removedIssue = await tx
             .delete(issues)
             .where(eq(issues.id, id))
@@ -12152,6 +12177,7 @@ export function issueService(db: Db) {
         await notifyRunDispatch(tx, { companyId: issueCompany.companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+        await notifyRoutineExecutionStatus(tx, id);
         return tx
           .update(issues)
           .set({
@@ -12288,6 +12314,7 @@ export function issueService(db: Db) {
             await notifyRunDispatch(tx, { companyId: issueCompany.companyId });
             await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
             await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+            await notifyRoutineExecutionStatus(tx, id);
             return tx
               .update(issues)
               .set(adoptionSet)
@@ -12546,6 +12573,7 @@ export function issueService(db: Db) {
         await notifyRunDispatch(tx, { companyId: existing.companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId: existing.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+        await notifyRoutineExecutionStatus(tx, id);
         const updated = await tx
           .update(issues)
           .set({
@@ -12610,6 +12638,7 @@ export function issueService(db: Db) {
         await notifyRunDispatch(tx, { companyId: existing.companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId: existing.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+        await notifyRoutineExecutionStatus(tx, id);
         const updated = await tx
           .update(issues)
           .set(patch)
