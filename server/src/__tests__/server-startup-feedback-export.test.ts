@@ -1,6 +1,6 @@
-import { routineExecutionStatusService } from "../services/routine-run-status.js";
-import { attentionRetentionService } from "../services/attention-retention.js";
 import { statusCardEvaluationService, registerStatusCardEvaluationWork } from "../services/status-card-evaluation.js";
+import { attentionRetentionService } from "../services/attention-retention.js";
+import { routineExecutionStatusService } from "../services/routine-run-status.js";
 import { nativeHarnessBackupExpirationService } from "../services/native-runtime/native-harness-backup-expiration.js";
 import { skillVersionRetentionService } from "../services/skill-version-retention.js";
 import { approvalQueueSeedingService } from "../services/approval-queue-seeding-work.js";
@@ -14,7 +14,7 @@ import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
 import * as idleLocalWork from "../services/idle-local-work.js";
 import { idleBackupWakeMarker, markIdleBackupWakeRequired } from "../services/idle-database-backup.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
-import { decisionService, decisionRetentionService, toolAccessService, reconcileBuiltInAgentsOnStartup, reconcileCodexLocalManagedHomesOnStartup, reconcilePersistedRuntimeServicesOnStartup } from "../services/index.js";
+import { decisionService, decisionRetentionService, toolAccessService, githubConnectionEventService, reconcileBuiltInAgentsOnStartup, reconcileCodexLocalManagedHomesOnStartup, reconcilePersistedRuntimeServicesOnStartup } from "../services/index.js";
 
 import { companies, runDatabaseBackup, type Db } from "@paperclipai/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +38,13 @@ const cloudMigrationMocks = vi.hoisted(() => ({ migrate: vi.fn(async () => null)
 vi.mock("../services/cloud-configuration-migration.js", () => ({ migrateCloudConfiguration: cloudMigrationMocks.migrate }));
 vi.mock("../services/cloud-configuration-qualification.js", () => ({ qualifyCloudConfigurationForCurrentImage: cloudMigrationMocks.qualify }));
 vi.mock("../telemetry.js", () => ({ initTelemetry: cloudRuntimeStartupMocks.telemetry, getTelemetryClient: vi.fn(() => null) }));
+
+// Producer transaction/notification behavior is covered by the real PostgreSQL
+// GitHub worker suite; this startup seam supplies a lightweight database mock.
+vi.mock("../services/delivery-work-notifications.js", async () => ({
+  ...await vi.importActual<typeof import("../services/delivery-work-notifications.js")>("../services/delivery-work-notifications.js"),
+  subscribeDeliveryWork: vi.fn(() => () => {}),
+}));
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -137,6 +144,8 @@ const {
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    registerResidualRecoveryWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
+    registerActiveRunSilenceWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
     registerIssueStateRecoveryWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
     registerDeferredReceiptWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
     registerRunDispatchWork: vi.fn((_coordinator: unknown, _canRun: () => boolean) => ({ ready: Promise.resolve() })),
@@ -451,6 +460,7 @@ vi.mock("../services/index.js", () => ({
   externalObjectService: externalObjectsServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
   githubConnectionEventService: vi.fn(() => ({
+    nextPollAt: vi.fn(() => null),
     pollOnce: vi.fn(async () => ({
       leased: 0,
       processed: 0,
@@ -502,6 +512,8 @@ vi.mock("../services/index.js", () => ({
       needsAttention: 0,
       failed: 0,
     })),
+    nextGitHubConnectionContinuityAt: vi.fn(async () => null),
+    githubConnectionContinuitySchedule: vi.fn(async () => []),
     sweepGitHubConnectionContinuity: vi.fn(async () => ({
       checked: 0,
       due: 0,
@@ -983,6 +995,8 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: enabled }));
     await startServer(); await settleStartupHousekeeping();
     expect(heartbeatServiceMock.registerIssueStateRecoveryWork).toHaveBeenCalledTimes(enabled ? 1 : 0);
+    expect(heartbeatServiceMock.registerResidualRecoveryWork).toHaveBeenCalledTimes(enabled ? 1 : 0);
+    expect(heartbeatServiceMock.registerActiveRunSilenceWork).toHaveBeenCalledTimes(enabled ? 1 : 0);
     expect(heartbeatServiceMock.registerRunDispatchWork).toHaveBeenCalledTimes(enabled ? 1 : 0);
     expect(heartbeatServiceMock.registerDeferredReceiptWork).toHaveBeenCalledTimes(enabled ? 1 : 0);
     expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
@@ -1357,6 +1371,32 @@ describe("startServer feedback export wiring", () => {
     expect(completionSweepMock).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])("registers GitHub delivery/deadline workers once without aggregate polling (scheduler=%s)", async enabled => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: enabled, heartbeatSchedulerIntervalMs: 30_000 }));
+    const ticks: Array<() => void> = [];
+    const intervals = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms: number) => {
+      if (ms === 30_000) ticks.push(callback);
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer(); await settleStartupHousekeeping();
+      for (const queue of [DELIVERY_QUEUES.connectionEvents, DELIVERY_QUEUES.connectionContinuity]) {
+        expect(deliveryWorkRegisterMock.mock.calls.filter(([registered]) => registered === queue)).toHaveLength(1);
+      }
+      const polls = vi.mocked(githubConnectionEventService).mock.results.map(result => result.value.pollOnce);
+      const sweeps = vi.mocked(toolAccessService).mock.results.map(result => result.value.sweepGitHubConnectionContinuity);
+      const schedules = vi.mocked(toolAccessService).mock.results.map(result => result.value.githubConnectionContinuitySchedule);
+      expect(sweeps.reduce((sum, call) => sum + call.mock.calls.length, 0)).toBe(0);
+      const count = () => [...polls, ...sweeps, ...schedules].reduce((sum, call) => sum + call.mock.calls.length, 0);
+      const startup = count();
+      expect(startup).toBe(2);
+      for (let i = 0; i < 3; i++) for (const tick of ticks) tick();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(count()).toBe(startup);
+      expect(deliveryWorkErrors.filter(error => error.queue === DELIVERY_QUEUES.connectionEvents || error.queue === DELIVERY_QUEUES.connectionContinuity)).toEqual([]);
+    } finally { intervals.mockRestore(); }
+  });
+
   it("does not rescan idle tool health from the aggregate maintenance tick", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true, heartbeatSchedulerIntervalMs: 30_000 }));
     let tick: (() => void) | undefined;
@@ -1403,7 +1443,8 @@ describe("startServer feedback export wiring", () => {
       intervalCallback?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(heartbeatServiceMock.sweepStaleIssueLocks).not.toHaveBeenCalled();
-      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenLastCalledWith({ staleThresholdMs: 300_000, skipNativeStatusWakeIntents: true, skipScheduledRetryCancellation: true, skipCapturedInstructionCommit: true, skipInstructionDirectoryCleanup: true, skipStoppedInstructionCollection: true, skipCancelledWorkspacePreservation: true, skipObsoletePolicyReviews: true, skipAutomaticCompletionReviews: true, skipUnsafeWorkspaceExports: true, skipNativePendingEffects: true, skipNativeResponsePresentation: true, skipNativeReviewResponse: true, skipNativeStatusReassessment: true, skipRetainedNativeSessionCleanup: true, skipNativeWorkspaceFinalization: true, skipNativeResultCommit: true, skipNativeRunProjection: true, skipNativeRecoveryNotices: true, skipExternalConversationSettlement: true, skipExternalAgentSettlement: true, skipNativeEnvironmentSettlement: true });
+      expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.scanSilentActiveRuns).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.promoteDueScheduledRetries).not.toHaveBeenCalled();
       expect(retiredDetector).not.toHaveBeenCalled();
@@ -1498,12 +1539,12 @@ describe("startServer feedback export wiring", () => {
       await Promise.resolve();
 
       expect(heartbeatServiceMock.tickAgentTimers).toHaveBeenCalledTimes(1);
-      expect(externalObjectsServiceMock.registerRefreshWork).toHaveBeenCalledTimes(1);
-      expect(externalObjectsServiceMock.registerRefreshWork).toHaveBeenCalledWith(expect.any(Object), expect.any(Function));
-      expect(deliveryWorkRegisterMock.mock.calls.some(([queue]) => queue === DELIVERY_QUEUES.externalObjectRefresh)).toBe(true);
       expect(issueThreadInteractionServiceMock.mergedPullRequestConfirmationPage).toHaveBeenCalledTimes(1);
       expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).not.toHaveBeenCalled();
       expect(deliveryWorkRegisterMock.mock.calls.some(([queue]) => queue === DELIVERY_QUEUES.mergedPullRequestConfirmations)).toBe(true);
+      expect(externalObjectsServiceMock.registerRefreshWork).toHaveBeenCalledTimes(1);
+      expect(externalObjectsServiceMock.registerRefreshWork).toHaveBeenCalledWith(expect.any(Object), expect.any(Function));
+      expect(deliveryWorkRegisterMock.mock.calls.some(([queue]) => queue === DELIVERY_QUEUES.externalObjectRefresh)).toBe(true);
       expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       const routineWorkerIndex = deliveryWorkRegisterMock.mock.calls.findIndex(([queue]) => queue === DELIVERY_QUEUES.routineSchedules);
@@ -1720,20 +1761,30 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
-  it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
+  it("keeps residual recovery independent after a partial hot-restart adoption", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
     }));
     heartbeatServiceMock.reconcileHotRestartAdoption.mockRejectedValueOnce(new Error("partial adoption"));
-    heartbeatServiceMock.reapOrphanedRuns
-      .mockRejectedValueOnce(new Error("transient reap failure"))
-      .mockResolvedValueOnce({ reaped: 0, runIds: [] });
+
 
     await startServer();
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
-    expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+    expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+    expect(heartbeatServiceMock.registerResidualRecoveryWork).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.registerActiveRunSilenceWork).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["recoverPendingSessionGoalActions", "recoverActiveSessionGoals"] as const)("continues independent recovery after %s startup failure", async method => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    heartbeatServiceMock[method].mockRejectedValueOnce(new Error("goal owner unavailable"));
+    await startServer(); await settleStartupHousekeeping();
+    expect(heartbeatServiceMock.registerResidualRecoveryWork).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.registerActiveRunSilenceWork).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.registerRunDispatchWork).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).not.toHaveBeenCalled();
   });
 
   it("closes the bound listener when native startup recovery fails", async () => {
