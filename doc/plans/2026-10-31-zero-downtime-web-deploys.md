@@ -1,36 +1,107 @@
 # Zero-downtime web deployments
 
-Date: 2026-10-31. Status (2026-11-01 14:05 UTC): existing-volume staging enrollment
-is complete and its read/save/file-integrity checks pass. Active-agent recovery,
-natural database idling and the ten-deploy staging campaign remain unqualified.
-No production canary yet.
+Date: 2026-10-31. Status (2026-11-01 15:39 UTC): existing-volume staging enrollment
+and manual sleep/wake preserve saved files and read/save behavior. The full local
+active-agent journey now passes on `cc23019691`; hosted browser continuity and
+the ten-deploy staging campaign remain unqualified. Natural database autosuspension
+passes after abandoned test-resource cleanup. No production canary yet.
 
-Latest critical path: Core #18543 includes runtime admission, immutable-cache
-retirement, remote agent-file projection, and adoption without rematerializing
-launch assets. The live test at `67714af9ff` transferred the same runner/session to
-controller generation two after deleting A's entire home, then failed in the full
-backend constructor: composing system instructions still read A's retired bundle.
-All three owned Daytona sandboxes were independently confirmed absent; the child
-credential was revoked and the test object bucket deleted. This remains failed
-evidence, not a successful deployment qualification.
+Core #18543 merged as `7751fc3107` after 55 successful CI checks, Greptile 5/5
+and no unresolved threads. It supplies runtime admission, immutable-cache
+retirement, remote agent-file projection, and adoption using validated admitted
+Runner instructions without rematerializing retired launch assets. The earlier
+`67714af9ff` deleted-bundle failure is reproduced and fixed; the `cd690de4d3`
+attempt was interrupted because the unrelated probe task blocked the business
+all-tasks-done oracle. The probe now has a separate disposable company; the oracle
+is unchanged. All test credentials, buckets and provider sandboxes were cleaned.
 
-The backend now accepts admitted instructions from a validated same-run Runner
-checkpoint. Runner owns checkpoint/template inspection; Core binds it to the
-current run, normalized session and context digest. Staged attachments select the
-validated target template. Fresh runs and ordinary later continuations still
-compose current instructions. The deleted-bundle reproduction failed before the
-fix, then passed with real backend session recovery and no new thread/turn start.
-All 59 backend factory tests and the focused checkpoint validation tests pass.
-At `cd690de4d3`, the real Codex/Daytona run survives removal of A's entire home,
-reattaches the same runner/session under generation two, and succeeds. Its next
-revision also succeeds. The handoff records 372 reads, 38 saves and 38 verified
-saves with zero failures. Full qualification still fails: the supervisor created
-an unrelated open probe task in the business company, so the unchanged all-tasks-
-done oracle could never advance to the second replacement. The attempt was
-interrupted and retained as incomplete. A regression reproduces this harness
-scope defect; probes now use their own disposable company. The oracle is unchanged.
-Exact-head review of the recovery fix is 5/5 with no unresolved threads; new
-fixture checks and another bounded live attempt are next.
+The complete retry at `f5915fdc33` exercised both replacements with 523 reads,
+53 saves and 53 verified saves, zero probe failures. The original remote execution
+survived with the same runner/session and completed once. Saved project tests,
+file-reference continuity, and the later useful answer passed. The workflow still
+FAILED: its later admission rotated native/provider sessions, and all four public
+run records lacked the native terminal contract. These failures remain acceptance
+blockers, not successful qualification.
+
+The next slice owns those gaps at existing boundaries: instruction authority
+exposes the committed entry digest without reading a disposable cache; heartbeat
+session compatibility identifies immutable skill versions rather than their host
+paths; the native receipt transaction publishes its accepted terminal contract
+without depending on the originating adapter returning. Both regressions failed
+before the changes. All 249 affected workspace/session, durable-file and control-
+plane persistence tests pass, as does server typecheck. Assembled admission suites
+ran 59 passing cases, but native resumption teardown closed every client on the
+shared database host, including its fixture's admin connection. This reproduces
+on clean master; limiting teardown to the owned database makes all 16 native
+resumption cases pass. PR #18552 has a 5/5 review for the initial fix.
+
+The next real attempt at `d2165dec5d` failed before B became ready: startup
+recovery tried to lock a run still owned by A, hit a one-second PostgreSQL lock
+timeout, and aborted startup. Its credential and bucket were cleaned; provider
+cleanup is independently checked after the asynchronous stop/delete transition.
+A three-case regression reproduces this for locked issue, run and coordinator
+rows. The fix skips those locked rows, schedules the same concrete run through
+the existing recovery retry, and avoids a diagnostic write that would wait on the
+same lock. All 74 enabled restart recovery tests pass, including the assembled startup
+caller; eight Docker-specific cases were not enabled in that run. Real content, skill-version,
+model, credential and task boundaries remain compatibility checks.
+
+The real retry at `aae8a53d01` reached a different startup failure: the readiness
+gate treated a run still preparing its skill selection as an unmigrated skill
+installation. Saved rows show committed version-backed skills and one admitted
+run whose exact pins had not yet been published. The new PostgreSQL regression
+fails before the fix. Startup now checks installation durability independently
+of active run pinning; maintenance eligibility, migration and cache eviction
+keep their conservative pin requirements. Missing durable versions still refuse
+readiness. All 33 readiness, managed-skill and durable-file tests pass, with server
+typecheck. The failed attempt remains failed evidence; its child credential,
+bucket and all three provider sandboxes were cleaned and checked. Review also
+replaced the whole agent-file manifest read with a scalar SQL digest projection.
+PR #18552 merged as `c0550e7010` with all required CI green, Greptile 5/5,
+and its scalar-query review findings resolved. The real `a15a12651c` attempt
+passed both web replacements: 765 reads, 78 saves and 78 verified saves with
+zero HTTP probe failures. The active execution survived once; the first three
+turns retained the native/provider session and accepted terminal contract.
+The fourth continuation FAILED: the retained Runner was safely suspended with
+an empty outbox and no pending terminal, but warm recovery attempted live-idle
+reattachment. Its provider state and diagnostics are preserved; all three owned
+sandboxes were independently confirmed absent. The next bounded fix reuses the
+existing per-turn suspended-receipt restoration for warm admission after cache
+loss, preserving physical sandbox binding and ordinary admission fences.
+A real PostgreSQL/Linux Runner regression reproduces the exact live error before
+the fix. Recovery then exposed a second stale-cache read: source reconciliation
+tried to stage new launch assets that the transport deliberately had not created.
+The existing remote process launcher now passes its structured launch identity
+to asset preparation, so reconciliation preserves the previous authority's
+retained launch files. Both new regressions pass: three turns preserve one
+provider thread after two cache deletions, including a failed remote state read
+and retry. All ten Linux continuity scenarios and 1,067 surrounding boundary tests pass.
+The exact `cc23019691` server build passes. PR #18554 has Greptile 5/5; CI and
+its second review identified a narrower dispatch boundary: warm receipt
+inspection must leave every non-suspended state to the existing live-adoption
+checks. A new preliminary-read regression fails before that refinement. The
+refinement plus both suspension regressions pass in a fresh Linux fixture, and
+server typecheck passes. The first retry reused a container whose deliberately
+failed pre-fix case left its live Runner on the ingress port; that infrastructure
+failure is preserved. The local wrapper now creates and cleans one container per
+invocation. This does not weaken the existing idle check or claim support for
+adopting a persistently backpressured Runner.
+
+The live Codex/Daytona attempt at that clean source PASSED on its first attempt,
+with no automatic retries: 518 reads, 53 saves and 53 verified saves across both
+replacements, zero probe failures, both complete predecessor homes deleted.
+The active execution resumes under the replacement and completes once. All four
+turns use the same native/provider session with accepted native terminal records.
+The final turn runs the saved project and returns the independently checked
+output. The original Git commit, untracked workspace reference, prior downloads
+and revised files survive. Browser reconnection remains explicitly unqualified
+in this API-led continuation case and must pass in the hosted campaign.
+Child credential, bucket and local test-home cleanup passed. Independent provider
+verification found two archived setup sandboxes left by the harness; those exact
+owned residuals were deleted separately and independently confirmed absent,
+preserving the failed automatic-cleanup verification. The product journey pass does not prove automatic fixture cleanup. The attempt's
+reported-plus-estimated model/runtime cost is about $0.243. Its immutable evidence
+is `zdt-live-2026-11-01T15-24-43-429Z` under the private live-evidence directory.
 
 Review also identified save quotas incorrectly applied during cache recovery.
 Recovery uses the existing inbound remote projection and preserves path/link
@@ -49,9 +120,15 @@ The original browser tab reconnected and persisted a task title. Server logs lat
 showed old Agents chunks returned 404 and navigation recovered via a page reload:
 this is migration continuity evidence, not uninterrupted old-tab asset loading.
 
-Two eight-minute natural database-idle observations failed. A separate bounded SQL
+Three eight-minute natural database-idle observations failed. A separate bounded SQL
 attribution window saw no other app-database sessions; it is diagnostic stimulus,
-not idle proof, and does not establish the source of provider activity. Automatic
+not idle proof, and does not establish the source of provider activity. The third window, bracketed by closed SQL counter snapshots, recorded 36 transactions and small read deltas on environment setup, leases, environments and plugins; no app-row writes. A later scoped diagnostic found an abandoned ephemeral setup sandbox still
+archived at the provider despite a historical cleanup-success row. The normal
+verification worker revisited it every five minutes. After deleting that exact
+owned sandbox, the product independently stamped its destroyed-resource proof;
+no historical row or cleanup evidence was manually rewritten. The fresh provider-metadata-only observation passed: the same single volume-free
+web deployment remained serving while Neon automatically suspended after its
+five-minute idle timeout. No app HTTP or SQL was used during the observation. Automatic
 idle sleep was correctly refused because this development fixture is not eligible
 for the free/demo policy. Manual sleep with force disabled passed: the registry
 reports sleeping, Railway has no active web deployment or attached volume, and
@@ -125,9 +202,9 @@ Measure one-time setup separately from repeated attempts. Keep failed evidence.
 | Item | State | Next action |
 | --- | --- | --- |
 | Prior prerequisites | #18403 and all five storage workstreams merged | Retain the ephemeral filesystem contract |
-| Core implementation | #18518, #18526, #18529, #18530, #18531 and #18533 merged; local packaged migration, browser overlap, cold restoration and durable command proofs recorded below | Complete live remote execution, accounting and later continuation qualification |
+| Core implementation | #18518, #18526, #18529, #18530, #18531, #18533, #18543 and #18552 merged; #18554 reviewed at 5/5 with CI pending; local packaged migration, browser overlap, cold restoration and durable command proofs recorded below | Publish and qualify the exact fixed release after CI/review merge |
 | Cloud implementation | #1096, #1098, #1099, #1100, #1101 and #1102 merged; #1102 serving on staging | Verify repeated Railway overlap behavior after Core recovery qualification |
-| Staging | Original enrollment complete; migrated data and signing key preserved; volume detached and retained | Diagnose idle behavior, verify sleep/wake and repair, then qualify ten app-only replacements |
+| Staging | Original enrollment complete; migrated data and signing key preserved; volume detached and retained | Sleep/wake and natural database idle pass; verify repair and ten app-only replacements with browser continuity |
 | Production | No canary mutation performed | Proceed only after the staging and active-agent acceptance gates pass |
 
 Keep PRs, tested revisions, artifact identities, evidence paths, deployment targets
