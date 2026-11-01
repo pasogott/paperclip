@@ -1,7 +1,7 @@
 # Zero-downtime web deployments
 
-Date: 2026-10-31. Status: implementation in progress; local HTTP/storage overlap,
-failure recovery and graceful drain passed. Cloud shape implementation underway.
+Date: 2026-10-31. Status: runtime and Cloud overlap policy merged; qualification
+and existing-volume enrollment remain in progress. No hosted acceptance claim.
 
 ## Outcome and endpoint
 
@@ -250,10 +250,195 @@ the normal build vendoring step corrected it. All three attempts cleaned up.
 
 Staging read-only discovery and authentication work with AWS `paperclip-dev`
 (account `078455283791`); production `paperclip-prod` is also authenticated.
-The existing shared `canary-staging` stack is `stack-pool-8fabb27531db77af`.
+The existing shared `canary-staging` stack is `stack-pool-8fabb27531db`.
 Do not assume it is exclusively owned: select a dedicated zero-downtime test
 stack or acquire the existing stack operation lock before any hosted mutation.
 No hosted mutation or paid model call has occurred for this task yet.
 
 Remaining: live overlap proof; released artifacts; migration/enrollment and
 compatible rollback; ten staging deployments; internal production canary.
+
+The active-overlap harness is a separate stacked PR [#18526](https://github.com/paperclipai/paperclip/pull/18526)
+on runtime PR #18518 to preserve the repository's review-size boundary. Its first
+review found that the checkpoint observer lacked the disposable encryption key
+and that forced process cleanup could pass graceful qualification. Both are
+corrected; 22 focused tests passed, including actual child shutdown and shared
+key decryption/restoration. The earlier model-free receipt remains evidence for
+HTTP availability and cleanup, not active checkpoint recovery.
+
+The full harness run at `0f122611a1` completed with 5,814 passes, 17 failures and
+four skips. Preserve `/private/tmp/paperclip-zdt-e2e-unit-all-rolling.log`:
+four onboarding mock expectations, four unchanged workflow security expectations,
+one Pi profile version expectation, three date-expired accounting fixtures,
+two report-command timeouts, two process-shutdown races and one host embedded
+Postgres startup failure. The complete shutdown file passed in the focused run;
+other failures still need base-revision classification. No blanket green suite
+or live availability claim is made.
+
+### Current delivery state, 2026-11-01 08:00 UTC
+
+Runtime PR #18518 merged as `006d5691a6245d5a710e25ba3df6d609754e163a` after
+all CI passed and a 5/5 review. The opt-in remains disabled on hosted stacks.
+Qualification PR #18526 remains open; Cloud #1096 remains open. No hosted
+mutation or paid model test has occurred yet.
+
+Fresh browser receipt `paperclip-runner-e2e-tg3nel` passed all 11 checks:
+246 reads, 50 acknowledged/read-back saves, zero failures, 1,058ms browser
+reconnect and zero page errors. Both old homes were deleted; C restored saved
+files with legacy adoption disabled. Unready B left A serving. The admitted
+save and both handoffs now require a graceful exit, not successful forced cleanup.
+Cleanup is confirmed. The receipt uses compiled local server/UI and workspace
+dependencies at `59e6169af6` plus the smoke's strict-exit patch; it is not a
+released-container or live-agent claim.
+
+Qualification exposed an expired/released-lease Stop race: absent a local handle,
+a new server could acknowledge a no-op before recovery attached the execution.
+Stop now remains pending while an unsettled native execution exists, including
+between leases. Three real-PostgreSQL delivery cases pass; the provider edge and
+recovery claim are simulated. Server TypeScript compilation and vendoring pass.
+
+The full harness's two report timeouts passed an isolated 42-test file rerun.
+Onboarding, workflow-security, Pi and accounting files are unchanged by this
+branch versus the inspected master; this is static classification, not a fresh
+full baseline run. The qualification PR's CI has one access-service race failure
+and is being checked in isolation. All other checks passed on `59e6169af6`.
+
+Cloud now gates overlap on identical, provenance-bound package identities.
+Changed or unknown packages use maintenance. Its 376 campaign/compatibility
+cases passed; review identified that failed-deploy rollback also needs the same
+pause. That correction is in verification. Existing-volume enrollment and the
+hosted acceptance sequence remain required work, not deferred scope.
+
+
+### Current delivery state, 2026-11-01 08:40 UTC
+
+Runtime #18518 is merged at `006d5691a6245d5a710e25ba3df6d609754e163a`;
+Cloud #1096 is merged at `23fdc849029e541355fa4e11234a3b5706b01e84`.
+Both passed CI and final 5/5 reviews with comments resolved. Core's Docker and
+readiness artifacts have published; its release workflow remains in progress.
+No explicit hosted enrollment or stack deployment has been performed by this
+chat; automatic release pipelines are separate and need deployed-revision checks.
+
+Qualification #18526 at `f2bcb4c73b` passed all CI checks. Three review findings
+are fixed in the next commit: explicit mock-call isolation; pending Stop permits
+only fenced reattachment of the original remote execution for cleanup; and the
+recovery observer advances its event floor after A is confirmed dead while
+preserving the original owner/authentication baseline. Six focused executor cases,
+three PostgreSQL delivery cases (provider edge simulated), 19 harness cases and
+server/E2E typechecks pass. The fixture initially returned a mock from beforeEach,
+which Vitest invoked as teardown; the corrected hook returns nothing.
+
+Three live attempts failed before agent creation: missing built Daytona plugin,
+missing development TypeScript loader in isolated controller copies, then invalid
+provider credentials. The first two harness setup gaps are fixed. The third
+Daytona preflight reported cleanup uncertain; the saved key returns 401, and the
+staging manager found no sandbox with that exact attempt label. This does not
+prove absence in an unknown old-key organization. The OpenAI key independently
+returns 401. A user request to refresh the E2E credential is pending; do not
+retry a paid attempt until authentication succeeds. No model execution is claimed.
+Private receipts are under `/private/tmp/paperclip-zdt-live-evidence`.
+
+A Linux Runner binary built from `0f122611a1` has SHA256
+`681f9709f21abcc90f6e87fd1d0b263c158896b8fb3d30df6786d89723ddfdad`;
+its source inputs are unchanged at the qualification head. The pinned Daytona
+base image and dynamic library checks pass. The next launcher preflights OpenAI,
+uses the authenticated staging manager to mint one attempt-specific Daytona key,
+and revokes it during cleanup. No attempt key has yet been minted.
+
+Enrollment implementation is isolated in Core
+`/private/tmp/paperclip-zdt-enrollment-20261101` and the Cloud worktree, both on
+`codex/zero-downtime-enrollment`. Core's dedicated maintenance process is being
+verified: ordinary app writers never start; existing owner migrations verify
+shared bytes; the original decision key exports only through a per-attempt
+credential after full eligibility. Cloud's locked, audited provider transition
+must stop all writers, run this process on the retained volume, preserve its key,
+then detach only after a matching receipt and confirmed process exit.
+
+Remaining acceptance is unchanged: live Stop/answer/follow-up and continuation,
+packaged fresh/migrated overlap, ten staging deployments including rollback,
+repair/sleep/wake and idle suspension, then one internal production canary.
+
+
+### Current delivery state, 2026-11-01 09:15 UTC
+
+Qualification #18526 merged as `16787e4167fa94bd968419cf6e6e9e8ebb2748c4`
+with all checks green and a 5/5 review. Cloud enrollment #1098 merged as
+`316163b28d4f9e811e810a3226ea46b33a273ce7` after 5/5 review and green CI.
+Its review fixes explicitly reopen registry routing on completion and allow
+same-attempt final-boot retry without reattaching the retained volume. No hosted
+stack has yet been enrolled by this chat.
+
+Core enrollment #18529 is at `6d31d1265d`. Twenty focused checks passed,
+including a rebuilt plain-Node executable and real PostgreSQL/S3. Owner checks
+now block unresolved local working copies even for terminal runs, drain all
+expired trace pages, and expire successful key-export authority at the original
+deadline. An integration fixture initially failed cleanup because trace expiry
+writes activity rows; cleanup now deletes those before their runs. The corrected
+run passed. Initial CI failures were a workspace-runtime health probe and an
+extra select in a run-dispatch idle assertion; latest-head CI/review is pending.
+
+An independent two-process question-answer probe exposed a real retry delay:
+B releases its claim after A inspects it, leaving the owner waiting 30.157s.
+The production pending-answer worker now uses a one-second retry in ephemeral
+mode; the same probe delivered one command in 1.197s. Ordinary server cadence
+is retained. A committed regression is in preparation: real PostgreSQL and two
+processes, with only the provider command sink simulated. It checks no repeated
+sweeps/inspections after settlement and reactivation by the next committed answer.
+The regression and assembled startup suite passed 122 tests. This does not
+prove live provider response or active remote execution survival.
+
+The refreshed E2E OpenAI credential remains outstanding. No subsequent paid
+attempt has been made. Remaining acceptance still includes live Stop/answer/
+follow-up/continuation, packaged overlap with migrated data and large cold
+restoration, ten staging deployments including rollback, repair/sleep/wake and
+idle suspension, and one internal production canary forward/rollback.
+
+
+### 2026-11-01 09:50 UTC qualification update
+
+Merged: Core runtime #18518 (`006d5691a6`), overlap workflow #18526
+(`16787e4167`), prompt native-answer delivery #18530 (`73cd8eb9a5`);
+Cloud shape #1096 and enrollment #1098 (`316163b28d`). The staging controller
+reports `316163b28d` from `/healthz`. Core maintenance #18529 is at
+`a4db955403`; all review findings are resolved and its final CI is running.
+
+The released Linux/amd64 image at Core `16787e4167`, digest
+`sha256:e383df8503e8bf160646d7ec42c3eb2d94979fb10b7ef4e6bf01a5057571166f`,
+passed authenticated private-mode overlap: 130 reads, 26 acknowledged saves,
+zero failures, two full predecessor-container/home deletions, the same browser
+session cookie, shared-file reads and unready replacement rejection. Every
+normal container exited cleanly. Test PostgreSQL and S3 resources were removed.
+Receipt: `/private/tmp/paperclip-zdt-container-eVSi2A/evidence.json`.
+This is HTTP session and storage proof; it does not qualify browser rendering,
+distinct versions or active model execution. Earlier failed fixtures retain
+receipts: local-trusted non-loopback bind refusal, loopback auth-origin rewrite,
+and incomplete public-origin configuration. They reached no overlap assertions.
+
+A 1,024-file, 64 MiB cold directory exposed sequential restoration timing out
+at 30.065s with 25ms added latency per GET. Receipt:
+`/private/tmp/paperclip-zdt-cold-cAEX5q/evidence.json`. The file authority owner
+now restores with eight bounded streams, cancelling and awaiting every sibling
+on failure. The same real PG/S3 experiment passed in 4.180s (1,025 GETs including
+instructions), with the entire predecessor home deleted and local adoption
+disabled. Receipt: `/private/tmp/paperclip-zdt-cold-C0DRZV/evidence.json`;
+tested source patch: `/private/tmp/paperclip-zdt-cold-restore-tested.patch`.
+Eight durable-file regressions passed, including corruption, cancellation,
+retained previous projection and successful retry. This qualifies the recorded
+size and latency; the unchanged upper storage limits are not a performance claim.
+
+The existing staging volume E2E target was selected after browser access and
+idle-agent checks. Its active fleet campaign was allowed to finish; the target
+was then pinned through the audited user-managed API. Exact private target,
+prior version, audit and resulting version are recorded in
+`/private/tmp/paperclip-zdt-staging-pin.json`. No volume has been detached or
+hosted overlap sequence started by this chat. Deploy and qualify the merged
+maintenance image before calling enrollment; the enrollment/campaign owners
+must continue to hold their normal operation leases.
+
+The local paid-run gate is still the saved E2E OpenAI credential returning 401.
+The credential file has not changed since August; a refresh request is pending.
+No paid model ran and no attempt-specific Daytona credential was minted through
+the new launcher. Existing live failure/cleanup receipts remain unchanged.
+Still required: active execution and continuation, cross-process follow-up,
+migrated packaged overlap, ten staging replacements including rollback, browser
+and sleep/wake/idle verification there, and one internal production canary.
