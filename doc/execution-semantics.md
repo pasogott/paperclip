@@ -1057,6 +1057,17 @@ folder), or an exhausted budget leaves a board-owned recovery action. Stranded-w
 recovery names this failure for the statuses it scans; for other statuses, such as
 a `blocked` task woken by a reply, the failure path records the action directly.
 
+A retained sandbox can still hold a workspace's earlier root after the workspace
+moved to another allocation, for example when child tasks inherit a parent's
+workspace and save newer work on their own sandboxes. When the parent wakes on its
+retained sandbox, the restore may replace that occupied root only when the server
+proves it is the workspace's own earlier allocation on this sandbox: the last
+recorded use of that root on this sandbox is an earlier epoch that ended in a
+quiesced, committed final save, and the folder carries a Paperclip preparation or
+restore receipt. Its files are then already part of the saved lineage being
+restored. Any other occupant (no receipt, a later unsaved use, or a sandbox that
+never saved that root) is still refused with `reason=occupied_root`.
+
 The provider's own idle auto-stop must not coincide with the warm runner idle
 window. The host forwards the run's effective warm idle window (environment
 `runnerIdleTimeoutMs`, else the agent's `idleTimeoutMs`) to the sandbox provider
@@ -1872,6 +1883,12 @@ cause instead of reporting a failed turn with `error: null`. A transport failure
 does not prove that the provider stopped or that a retry is safe; it remains
 non-recoverable until the existing ownership and recovery checks establish the
 next permitted action.
+
+The same applies when the shared session notification stream closes
+(`notification_transport_failed`). The stream can close because of host-side
+runner supervision, such as a stopped sandbox plugin worker, as well as because
+of the provider. The terminal failure message therefore keeps the redacted,
+bounded cause. It does not name the provider unless the cause does.
 
 If a failed sidecar control closes an ACPX session before the event pump observes
 the failure, its terminal retains the original closed-code diagnostic. Later
@@ -2877,6 +2894,14 @@ outside the loaded conversation. The user does not need to select a workspace
 or grant access to the other task. An explicit pending workspace choice takes precedence over recovery.
 
 ### Operator identity and permission for manual dispatch
+
+Routine creation keeps the authenticated responsible user separate from creator
+attribution. An agent-created routine uses the server-resolved on-behalf-of user
+from its run or API key; the agent remains the creator. Without a bound identity,
+the service retains its parent-task and company-default fallback. Automatic
+routine executions use the saved revision's responsible user. A person clicking
+Run now supplies a new execution identity, so that manual task uses the clicking
+person's authority and AI account selection rather than the routine creator's.
 
 A legacy queued-message Interrupt is a new instruction from the user who clicks
 it. The new run uses that user's execution identity, including when someone else
