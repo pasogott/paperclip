@@ -295,7 +295,7 @@ export {
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
 } from "./app-definitions.js";
-export { isConnectorFeatureEnabled } from "./connector-availability.js";
+export { isConnectorFeatureEnabled, nativeConnectorRequiresCustomerOAuthApp } from "./connector-availability.js";
 export { getAppDefinitionForApplicationKey } from "./connector-identity.js";
 export {
   connectionSetupStateForApp,
@@ -2888,3 +2888,4 @@ export {
 export { readProviderFailure, type ProviderFailure } from "./provider-failure.generated.js";
 export type { BoardBootstrap, BoardBootstrapSession } from "./types/board-bootstrap.js";
 export { readBoardBootstrap } from "./board-bootstrap.js";
+export * from "./provider-rate-limits.js";

@@ -46,6 +46,18 @@ See [the schemas](../../packages/plugins/sdk/src/environment-tasks.ts) for all f
 | `stop` | `accepted` | Stop the task and its descendants. Fence a delayed submission. |
 | `complete` | `accepted` | Release task resources after Core saves required results. |
 
+For a refused `submit` with `resumeFrom`, a driver can throw an error with
+`status: 409`, `code: "SESSION_STATE_UNAVAILABLE"`, and `reason` set to
+`"unresolved_operation"` or `"source_state_unverified"`. The SDK worker and
+Core preserve only these closed diagnostic fields. They replace the provider
+message and omit provider identities and text. Read the validated RPC envelope
+with `readEnvironmentTaskErrorDiagnostic`.
+
+This diagnostic does not authorize a retry, replacement, cleanup or state
+change. Other task failures keep the existing generic error. An older SDK
+does not carry this diagnostic. Operation and call identities, when needed,
+must come from Core's own retained records.
+
 Each result must contain the task ID from the request. Core rejects a result
 with a different ID or result kind. A WSS URL must have no user information,
 query, or fragment. Return authentication in the secret headers.
@@ -54,6 +66,27 @@ query, or fragment. Return authentication in the secret headers.
 authorized project IDs, and optional launch limits. It can also contain a saved
 task ID for session reuse and a typed Codex or Claude credential. Core does not
 supply an executable command or a guest path.
+
+## Error codes
+
+Core does not read the text of a task error. To report a failure that Core can
+act on, throw `PluginEnvironmentTaskError` with a code from
+`ENVIRONMENT_TASK_ERROR_CODES`. The SDK sends only the code as structured RPC
+error data.
+
+| Code | When to use it | Core behavior |
+| --- | --- | --- |
+| `runner_revision_mismatch` | The installed Runner does not match the revision that the plugin launches. Throw it from `describe` or `submit` before you prepare or start a task. | A run that has not started provider work is retried for up to 10 minutes. Agent verification checks again every minute. The task is not blocked during this wait. |
+
+```ts
+import { PluginEnvironmentTaskError } from "@paperclipai/plugin-sdk";
+
+if (installed.revision !== expectedRevision) {
+  throw new PluginEnvironmentTaskError("runner_revision_mismatch");
+}
+```
+
+Any other error stays an ordinary setup failure. The source refusal diagnostic above is separate: it uses its own envelope and does not authorize a retry.
 
 ## Launch preparation
 
@@ -83,6 +116,39 @@ authority as submission.
 
 Core requires preparation version 1 for native plugin execution. It validates
 and saves the result before it submits its configuration ID.
+
+### Stopped source reconciliation
+
+A plugin’s `describe` response advertises `codexSourceRecoveryVersion: 1` for
+Codex App Server and `acpxSourceRecoveryVersion: 1` for ACPX. It can advertise
+either, both, or neither. Each field means the host can verify and restore a
+stopped source for that provider without starting another turn. Core requires
+the field for the selected provider and verifies the run’s eligibility.
+
+The authenticated request belongs to
+the current run while `prepare` and `submit` carry the predecessor Runner identity.
+Core derives this relationship from its saved source-consumer claim; a mismatched
+run ID alone never grants recovery. Both operations must name the same `resumeFrom`, exact source Runner identity, and current
+`accountIdentity`. The request and lease still belong to the current run.
+Preparation must save this source binding with its new configuration. Submission
+must verify the same binding before it starts the source process.
+
+Core requires the source run to have a committed successful result, an encrypted
+PRP journal, confirmed physical termination, and no other source consumer. Core
+claims the source under the current native controller lease. This does not change
+the source run's status or result. A stale source controller cannot write its
+journal after this claim. Workspace export and settlement holds still apply.
+After source submission, the same current owner can prepare its attachment with
+the exact source as `priorIdentity`. This does not grant ordinary warm reuse.
+
+The provider must verify the original account, workspace, runtime, and source
+ownership before launch. The provider must reject saved active goals, pending tools, ambiguous starts, and
+uncertain work before launch. Runner verifies that a saved idle provider remains
+idle when restored.
+Until the existing authenticated `run.attach` operation changes authority, the
+Core retains semantic inputs and sends no fresh predecessor business commands
+while the restored source reconciles its journal and known cleanup. Ordinary suspended recovery and live attachment keep their existing
+checks. Providers that omit the capability do not support predecessor recovery.
 
 ## Launch authentication validation
 
@@ -156,6 +222,11 @@ same task ID. Do not allocate another task to resolve an uncertain reply.
 An accepted stop does not prove termination. Set `executionStopped: true`
 only after the Runner and all descendants have stopped. A terminal phase alone
 does not permit Core to release execution authority.
+
+Core binds each Runner owner to the physical task ID returned by its description.
+An old owner cannot follow a changed lease to stop or complete its replacement.
+Late stopped-state, retained-session and credential-handoff writes must still
+match that same physical task. A new owner can clean up the replacement.
 
 Core fences new submissions when cleanup starts. It stops the saved task,
 checks termination, saves credential results, and completes the task before it

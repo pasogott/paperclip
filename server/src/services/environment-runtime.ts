@@ -1,5 +1,6 @@
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
+import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 import { createOwnedSandbox, recoverSandboxCreations, recoverableTaskCreation } from "./sandbox-creation-operations.js";
@@ -1638,9 +1639,10 @@ function createSandboxEnvironmentDriver(
           );
         }
         if (pluginProvider.state === "worker_unavailable") {
-          throw new Error(
-            `Sandbox provider "${parsed.config.provider}" is installed via plugin "${pluginProvider.resolved.plugin.pluginKey}", but its worker is not running.`,
-          );
+          // No request reached the worker, so setup may retry this refusal
+          // within its bootstrap budget once the worker runs again.
+          throw new PluginWorkerUnavailableError({ pluginId: pluginProvider.resolved.plugin.id, workerStatus: null,
+            message: `Sandbox provider "${parsed.config.provider}" is installed via plugin "${pluginProvider.resolved.plugin.pluginKey}", but its worker is not running.` });
         }
 
         const workerConfig = {
@@ -3785,7 +3787,7 @@ export function environmentRuntimeService(
     },
 
     /** Dispatch plugin-provided Runner execution, including resource preparation and task lifecycle. */
-    async task(input: { companyId: string; leaseId: string; operation: PluginEnvironmentTaskOperation; executionContext?: unknown }) {
+    async task(input: { companyId: string; leaseId: string; operation: PluginEnvironmentTaskOperation; executionContext?: unknown; expectedTaskId?: string }) {
       if (!options.pluginWorkerManager) throw new Error("Plugin-provided Runner execution worker manager unavailable");
       return executeEnvironmentTask(db, options.pluginWorkerManager, input);
     },
