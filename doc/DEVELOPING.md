@@ -1939,6 +1939,20 @@ project with the same repository URL; publication locks and rechecks those sourc
 rows. Imports from mutable local folders still recapture and compare the
 current files; a saved upload does not permit later local edits to be discarded.
 
+When the verified Git source still exists, reconstruction also copies its local
+`info/exclude` rules into the private repository before applying a saved restore
+point. This keeps saved ignored files, including recovery receipts and bundles,
+in their original classification. The source ignore file stays unchanged.
+Symlinked, oversized, or changing source ignore files block reconstruction.
+
+Archived imports restore nested linked checkouts as private standalone
+repositories. The saved branch name belongs to the old path, so reconstruction
+does not register a new worktree or reset a branch in the shared project cache.
+A verified cache can supply Git objects without copying its current working
+files. Each private copy retains the restore point's extra commits under local
+refs so they survive portable archive capture and garbage collection. Ordinary
+linked-worktree recovery still requires its original path ownership.
+
 Shared physical folders require Cloud's offline enrollment maintenance process.
 A task-level hold cannot fence another workspace record pointing at the same
 folder. Maintenance verifies that legacy deployments have stopped and that no

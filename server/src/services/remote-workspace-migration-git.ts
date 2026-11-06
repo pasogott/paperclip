@@ -9,6 +9,7 @@ import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspa
 import type { StorageService } from "../storage/types.js";
 import { createIssueGitRemoteAuthProvider } from "./git-credentials.js";
 import { applyGitRestorePointToWorktree, ensureGitRestorePointCommit, loadGitRestorePoint } from "./git-restore-point-storage.js";
+import { copyVerifiedGitExcludes } from "./git-repository-excludes.js";
 import { restoreGitWorkspaceContents, type ManagedCheckoutSource } from "./git-workspace-contents.js";
 import { ensureSavedGitCommit, gitRestorePointExpired, managedSourcePaths, readGitCacheRestoration,
   verifiedGitCacheSource, verifiedManagedGitObjectSource, type GitCacheRestoration } from "./git-workspace-restoration.js";
@@ -180,6 +181,7 @@ export async function lockArchivedGitMigrationSources(db: Pick<Db, "select">, wo
   }
 }
 
+
 export async function materializeArchivedGitMigrationSource(input: {
   db: Db; storage: StorageService; workspace: Workspace; source: ArchivedGitMigrationSource; scratch: string;
 }) {
@@ -199,6 +201,7 @@ export async function materializeArchivedGitMigrationSource(input: {
       : await verifiedReceiptObjectSource(workspace, source.sourcePath);
     if (source.retainedBranch && (await git(verified, ["rev-parse", "--verify", `refs/heads/${source.retainedBranch}^{commit}`])) !== source.commit) throw unavailable();
     await fs.mkdir(cwd, { mode: 0o700 }); await git(cwd, ["init", "--quiet"]);
+    if (source.recipe?.restorePoint) await copyVerifiedGitExcludes(verified, cwd).catch(() => { throw unavailable(); });
     // Fetch objects, never the current working tree of a shared project root.
     const presentCommit = await git(verified, ["cat-file", "-e", `${source.commit}^{commit}`]).then(() => true, () => false);
     if (presentCommit) {
@@ -228,10 +231,10 @@ export async function materializeArchivedGitMigrationSource(input: {
   await git(cwd, ["symbolic-ref", "HEAD", `refs/heads/${workspace.branchName}`]);
   await git(cwd, ["config", "remote.origin.url", workspace.repoUrl]);
   if (source.recipe?.restorePoint) await applyGitRestorePointToWorktree({ storage: input.storage, workspace,
-    ref: source.recipe.restorePoint, repositoryCwd: cwd, worktreePath: cwd });
+    ref: source.recipe.restorePoint, repositoryCwd: cwd, worktreePath: cwd, preserveImportedHistory: true });
   const approvedLocalSources = new Set<string>();
   await restoreGitWorkspaceContents({ cwd, companyId: workspace.companyId, workspaceId: workspace.id,
-    projectId: workspace.projectId, contents: source.recipe?.contents, storage: input.storage, resolveGitAuth,
+    projectId: workspace.projectId, contents: source.recipe?.contents, storage: input.storage, resolveGitAuth, isolateRepositories: true,
     authorizeSource: async saved => {
       await authorizeNestedSource(input.db, workspace, saved);
       const local = localRepositoryPath(saved.repoUrl); if (local) approvedLocalSources.add(local);

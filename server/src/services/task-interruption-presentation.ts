@@ -68,6 +68,11 @@ const retryWaitMessages: Record<string, string> = {
   finalizing_saved_result: "Paperclip is finishing the saved result before Retry can continue.",
   cleanup_quarantined: "Retry cannot continue this attempt. Send a new message after the previous execution has stopped.",
   cancelled_by_operator: "This attempt was stopped. Send a new message to continue from saved work.",
+  // A new click replaces a Retry declined for its requester's access with a
+  // fresh attempt under the clicker's access, so Retry stays available.
+  retry_authority_denied: "Retry could not start with the requesting user's access. Press Retry to start it with yours.",
+  // An edited saved message can never be replayed; only new input continues.
+  retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
 
 /** Recognize old persisted failures without displaying arbitrary run error text. */
@@ -152,7 +157,7 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
     const reason = Object.hasOwn(retryWaitMessages, retryWait.executionWaitReason) ? retryWait.executionWaitReason : "execution_recovery";
     // Keep the latest input receipt so message submission can settle independently.
     return { ...base, state: "failed",
-      canRetry: !["cleanup_quarantined", "cancelled_by_operator"].includes(reason), retryWait: { reason,
+      canRetry: !["cleanup_quarantined", "cancelled_by_operator", "retry_source_changed"].includes(reason), retryWait: { reason,
       message: retryWaitMessages[reason] ?? "Retry is waiting for execution checks. Your message is saved." } };
   }
   if (wait && wait.requestedAt.getTime() > now - 10_000 && system?.state !== "exhausted")
@@ -160,7 +165,9 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
   return { ...base, state: "failed", canRetry: true, ...(projectAccess ? { projectAccess } : {}) };
 }
 
-/** Batch list reads rather than doing seven queries per row. Keep run logs and
+/** A scheduled retry has no outcome yet, so its provider failure is read from
+ * the predecessor it retries: the countdown keeps its reason.
+ * Batch list reads rather than doing seven queries per row. Keep run logs and
  * large result bodies out of this projection. */
 export async function taskInterruptionPresentations(db: Db, companyId: string, input: ProjectionIssue[]) {
   const selected = input.filter(issue => issue.companyId === companyId);
@@ -196,6 +203,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         or ${heartbeatRuns.errorCode} = 'workspace_validation_failed' then ${heartbeatRuns.error} else null end`,
       errorCode: heartbeatRuns.errorCode, livenessState: heartbeatRuns.livenessState, scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
       scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      // The run whose resultJson supplied providerFailure. A scheduled retry
+      // shows its predecessor's reason, so redaction must use that run's registry.
+      providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null
+        and ${heartbeatRuns.status} = 'scheduled_retry' and ${heartbeatRuns.retryOfRunId} is not null
+        then ${heartbeatRuns.retryOfRunId} else ${heartbeatRuns.id} end`,
       resultJson: sql<Record<string, unknown>>`jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
         'stopReason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'stopReason'`, 80)},
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
@@ -214,7 +226,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           'dispatched', coalesce(${heartbeatRuns.resultJson}->'nativeCancellation'->'dispatched' = 'true'::jsonb, false),
           'intentAuditId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeCancellation'->'intentAuditId'`, 160)},
           'acknowledgementAuditId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeCancellation'->'acknowledgementAuditId'`, 160)}),
-        'providerFailure', ${heartbeatRuns.resultJson}->'providerFailure')`,
+        'providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', case when ${heartbeatRuns.status} = 'scheduled_retry'
+          then (select predecessor.result_json->'providerFailure' from ${heartbeatRuns} predecessor
+            where predecessor.company_id = ${heartbeatRuns.companyId} and predecessor.id = ${heartbeatRuns.retryOfRunId}) end))`,
     }).from(requested).innerJoinLateral(latestRuns, sql`true`).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, latestRuns.id)))
       .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
       .orderBy(requestedIssueId),
@@ -309,16 +323,24 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         agentAdapter: run.agentAdapter ?? "unknown" });
     }
   }
-  const disclosures = [...result.values()].flatMap(presentation => (presentation?.providerFailure || presentation?.workspaceFailure) && presentation.observedRunId
-    ? [{ id: presentation.observedRunId, providerFailure: presentation.providerFailure,
-      workspaceFailure: presentation.workspaceFailure, presentation }] : []);
+  // Redact each explanation with the registry of the run that recorded it: the
+  // workspace failure is the observed run's, while a scheduled retry's provider
+  // failure may be its predecessor's.
+  const disclosures = [...result.entries()].flatMap(([issueId, presentation]) =>
+    (presentation?.providerFailure || presentation?.workspaceFailure) && presentation.observedRunId
+      ? [{ id: presentation.observedRunId, providerFailureRunId: runMap.get(issueId)?.providerFailureRunId ?? presentation.observedRunId,
+        providerFailure: presentation.providerFailure, workspaceFailure: presentation.workspaceFailure, presentation }] : []);
   if (disclosures.length) {
     try {
-      const [safe, settings] = await Promise.all([
-        createRunSecretRedactionRegistry(db).redactForRuns(companyId,
-          disclosures.map(({ id, providerFailure, workspaceFailure }) => ({ id, providerFailure, workspaceFailure }))),
+      const [redacted, settings] = await Promise.all([
+        createRunSecretRedactionRegistry(db).redactForRuns(companyId, disclosures.flatMap(({ id, providerFailureRunId, providerFailure, workspaceFailure }) => [
+          { id: providerFailureRunId, providerFailure, workspaceFailure: undefined },
+          { id, providerFailure: undefined, workspaceFailure },
+        ])),
         instanceSettingsService(db).getGeneral(),
       ]);
+      const safe = disclosures.map((_, index) => ({ providerFailure: redacted[2 * index]?.providerFailure,
+        workspaceFailure: redacted[2 * index + 1]?.workspaceFailure }));
       const safeMessage = (value: unknown) => typeof value === "string"
         ? [...redactCurrentUserText(value, { enabled: settings.censorUsernameInLogs })].slice(0, 4000).join("") : "";
       disclosures.forEach(({ presentation }, index) => {
