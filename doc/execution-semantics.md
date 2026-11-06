@@ -1227,6 +1227,22 @@ Newer saved input keeps its own receipt while the existing Retry explanation sta
 visible. Terminal waits direct the user to send new input and hide the Retry action
 that cannot continue that attempt.
 
+A remote native run can lose its original runner or sandbox before reattachment.
+This happens after a server restart, and for a same-run retry after a turn ends
+without a semantic result. The reattachment then fails with
+`native_remote_recovery_lease_mismatch`, `native_plugin_recovery_lease_mismatch`
+or `runner_remote_process_identity_unavailable`. The server requests the task
+Retry itself, once per run, under the authority of the user who sent the message,
+assigned the task, or clicked Retry. It does this only when the run recorded no
+provider turn or its last provider turn is settled. Activity records the request
+as `restart-recovery` on behalf of that user. Admission keeps every gate: saved-work
+recovery, stop proof, approvals, pauses, budget and ownership. A Retry that the
+server requested gets no second automatic attempt. System wakes and runs with an
+in-flight provider turn do not continue automatically. For these failed runs, a
+recovered workspace hold offers Retry (`canRetry`) and says "Retry or send a
+message to continue." An intentional Stop keeps "send a message" as its only
+continuation.
+
 When a native attempt fails before launch because its predecessor's session is
 quarantined, explicit task Retry verifies the retained journal's actual owner.
 That owner must belong to the same company, task, agent, workspace, native session,
@@ -1878,6 +1894,30 @@ Subtree pause and cancel record the authenticated board actor on each run they
 interrupt. A verified native stop must not become an unexplained failure simply
 because it came from a subtree action. The explicit pause hold still prevents
 future execution until Resume, and missing stop proof still blocks continuation.
+
+A run interrupted by a pause is an operator hold, not a failure. The pause's member
+snapshot names each interrupted run, and that work is owed one re-dispatch once no
+pause covers the task. The obligation belongs to the run, so overlapping pauses keep
+it until the last covering release. Releasing or resuming a hold re-dispatches owed
+work (`issue_tree_resumed`, with `holdId` and `interruptedRunId` in the wake
+context), even without `wakeAgents`. The interrupted run must still be the task's
+latest run, assigned to the same agent, and executable; normal admission gates still
+apply. A compare-and-set claim on the interrupted run makes the resume happen at most
+once. The claim is saved as `pending` and arms the execution-continuation queue in
+the same commit; the wake uses the stable idempotency key `tree-hold-resume:<runId>`.
+If the process stops before that wake is saved, the queue's sweep finds the stale
+claim, rechecks current state, and dispatches it once. A task that still needs execution reconciliation is not replayed: the release
+records `issue.tree_resume_wake_skipped`, the blocker stays visible, and the
+obligation stays unclaimed.
+
+A legacy run stopped before its gated dispatch entered the adapter has no provider
+actions to reconcile. Once its executor confirms no process, session, run-owned lease
+or execution event, it records bootstrap evidence and resolves that run's
+reconciliation hold as a false positive, including an automatic no-replay
+disposition. It restores a `blocked` status only when that disposition made the
+change (`legacyCancellationBlock` receipt). The executor then re-dispatches owed work
+if the pause was already released. The automatic disposition waits while a legacy
+executor still holds its controller lease. A hold can be released only once.
 
 ### Late provider usage
 
