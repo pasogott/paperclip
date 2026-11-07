@@ -417,7 +417,7 @@ export function createPostgresRunDispatchAdapter(
     facts.issueAssigneeAgentId = issue.assigneeAgentId;
     facts.issueExecutionRunId = issue.executionRunId;
     facts.issueCheckoutRunId = issue.checkoutRunId;
-    if (input.conversationContinuation) {
+    if (input.conversationContinuation || retryReason === "interrupted_preparation") {
       facts.pendingResponse = await connectionContinuationPendingResponse(dbOrTx as unknown as Db,
         issue, input.responsibleUserId, input.runId);
     }
@@ -657,7 +657,7 @@ export function createPostgresRunDispatchAdapter(
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
         unresolvedBlockerCount: readiness.unresolvedBlockerCount,
       } : null,
-      pendingResponse: issue && (input.conversationContinuation || context.connectionIntentResolution === "existing_connection")
+      pendingResponse: issue && (input.conversationContinuation || retryReason === "interrupted_preparation" || context.connectionIntentResolution === "existing_connection")
         ? await connectionContinuationPendingResponse(dbOrTx as unknown as Db, issue, input.responsibleUserId, input.runId)
         : null,
       issueFound: issue !== null,
@@ -1501,7 +1501,8 @@ export function createPostgresRunDispatchAdapter(
         }
       }
       const budgetBlock = stopRecovery ? null : await recheckAdmittedRunBudgetReadOnly(tx, { companyId: run.companyId, agentId: run.agentId,
-        runId: run.id, projectId: scope.projectId, reservationId: input.reservationId });
+        runId: run.id, projectId: scope.projectId, reservationId: input.reservationId,
+        admittedRecovery: Boolean(input.recoveryLeaseOwner) });
       if (budgetBlock) return { dispatched: false as const, admissionBlockReason: budgetBlock };
       if (input.recoveryLeaseOwner) {
         const [owner] = run.runtimeMode === "native" ? await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(

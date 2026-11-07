@@ -161,6 +161,9 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
   await adoptSystemRecovery(db, input);
   const initial = await loadSystemRecovery(db, input);
   if (initial?.state === "exhausted" && !canAdoptNativeSourceRetention(initial)) {
+    // A budget spent before this hold existed still names its receipt, so the
+    // board confirmation in its handoff can release it (RC-50 wave databases).
+    if (initial.failure?.code === "copyback_stop_unconfirmed") await recordCopybackOwnerHold(db, input, initial.generationId);
     await handOffExhaustedSystemRecovery(db, input, initial);
     return;
   }
@@ -390,6 +393,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
       const activity = await db.transaction(async tx => {
         await notifyNativeResultCommit(tx, input);
         await notifyNativeWorkspaceFinalization(tx, input);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
         await notifyNativeStatusReassessment(tx, input);
         await tx.insert(workspaceOperations).values({ companyId: input.companyId, issueId: input.issueId,
           heartbeatRunId: input.runId, phase: "workspace_finalize", status: "succeeded", finishedAt: new Date(),
@@ -438,12 +442,41 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
   const owned = await withNativeWorkspaceFinalizationOwnership({ db, companyId: input.companyId, runId: input.runId,
     retainedRepairActionId: input.actionId }, runAttempt);
   if (!owned.acquired && owned.reason === "owner_unverified") {
-    const current = await loadSystemRecovery(db, input);
-    const reserved = current && reserveSystemRecoveryAttempt(current);
-    if (current && reserved) await updateSystemRecovery(db, input, current,
-      failSystemRecovery(reserved, new SystemRecoveryFailure("copyback_stop_unconfirmed", "recheck_evidence")));
+    await holdForUnverifiedCopybackOwner(db, input);
     await recheckStoppedWorkspaceRecovery(db, input, false);
   }
+}
+
+/**
+ * A copyback owner that a restart killed can never confirm its own stop, and
+ * Retry cannot release its receipt (RC-50). Rechecking that receipt is not a
+ * recovery attempt: the bounded recovery window still applies, but no attempt
+ * is spent. Record the exact receipt so the board can confirm the stop through
+ * `resumeNativeWorkspaceAfterOwnerStop`, and so Retry names this wait.
+ */
+async function holdForUnverifiedCopybackOwner(db: Db, input: Source) {
+  const current = await loadSystemRecovery(db, input);
+  if (!current || current.state === "complete" || current.state === "exhausted") return;
+  const next = failSystemRecovery(current, new SystemRecoveryFailure("copyback_stop_unconfirmed", "recheck_evidence"));
+  if (!await updateSystemRecovery(db, input, current, next)) return;
+  await recordCopybackOwnerHold(db, input, next.generationId);
+}
+
+/** Bookkeeping only: names the exact receipt for the board. Grants no attempt. */
+async function recordCopybackOwnerHold(db: Db, input: Source, generationId: string) {
+  const [source] = await db.select({ owner: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceFinalizationOwner'` })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  const owner = source?.owner;
+  if (!owner || typeof owner !== "object" || typeof (owner as { token?: unknown }).token !== "string") return;
+  await db.update(issueRecoveryActions).set({
+    // A confirmation names one receipt; a newer unverified owner needs its own.
+    evidence: sql`(${issueRecoveryActions.evidence} - 'workspaceOwnerStop') || jsonb_build_object('workspaceOwnerRecovery',
+      jsonb_build_object('state', 'operator_required', 'owner', ${JSON.stringify(owner)}::jsonb))`,
+    updatedAt: new Date(),
+  }).where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.id, input.actionId),
+    eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,generationId}' = ${generationId}`,
+    sql`${issueRecoveryActions.evidence}#>'{workspaceOwnerRecovery,owner}' is distinct from ${JSON.stringify(owner)}::jsonb`));
 }
 
 const cursors = new WeakMap<Db, string>();
@@ -496,10 +529,16 @@ export function retainedWorkspaceCandidates(db: Db, cursor?: string, unfinishedO
     and ${agentWakeupRequests.status} = 'deferred_issue_execution' and ${agentWakeupRequests.requestedByActorType} = 'user'
     and ${agentWakeupRequests.payload}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text)`;
   const interruptedPreparation = sql`(${heartbeatRuns.runtimeMode} = 'legacy'
-    and ${heartbeatRuns.status} = 'interrupted'
+    and (${heartbeatRuns.status} = 'interrupted' or (${heartbeatRuns.status} = 'failed'
+      and ${heartbeatRuns.errorCode} = 'process_lost'
+      and ${heartbeatRuns.resultJson}#>>'{executionRecovery,kind}' = 'bootstrap'
+      and ${heartbeatRuns.resultJson}#>'{executionRecovery,providerWorkStarted}' = 'false'::jsonb))
     and ${heartbeatRuns.runtimeModeResolvedAt} is null and ${heartbeatRuns.executionStage} = 'preparing'
     and ${heartbeatRuns.runnerProfileJson}#>>'{adapterDispatch,adapterType}' = 'paperclip_runner'
-    and ${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'blocked'
+    and (${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'blocked'
+      or (${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'allowed'
+        and ${issueRecoveryActions.evidence}->>'bootstrapPreparationSettledAt' is not null
+        and coalesce(${issueRecoveryActions.evidence}->>'bootstrapPreparationContinuation', 'pending') in ('pending', 'deferred')))
     and exists (select 1 from ${issues} where ${issues.companyId} = ${heartbeatRuns.companyId}
       and ${issues.id} = ${issueRecoveryActions.sourceIssueId} and ${issues.assigneeAgentId} = ${heartbeatRuns.agentId}
       and ${issues.status} in ('todo', 'in_progress', 'in_review', 'blocked')
@@ -512,7 +551,10 @@ export function retainedWorkspaceCandidates(db: Db, cursor?: string, unfinishedO
         then (${issueRecoveryActions.evidence}->>'runId')::uuid end`)))
     .where(and(inArray(heartbeatRuns.status, terminal),
       workspaceRecoverySourceEligible(true),
-      unfinishedOnly ? sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' in ('scheduled', 'running', 'awaiting_evidence')` : undefined,
+      unfinishedOnly ? sql`(${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' in ('scheduled', 'running', 'awaiting_evidence')
+        or (${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' = 'complete'
+          and ${issueRecoveryActions.evidence}->>'bootstrapPreparationSettledAt' is not null
+          and coalesce(${issueRecoveryActions.evidence}->>'bootstrapPreparationContinuation', 'pending') = 'pending'))` : undefined,
       obligationsOnly ? sql`(${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' in ('scheduled', 'running', 'awaiting_evidence')
         or (${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' = 'complete' and (${cleanup} or ${interruptedPreparation})) or ${waitingInput})` : undefined,
       sql`(${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' in ('scheduled', 'running', 'awaiting_evidence', 'complete', 'exhausted')
