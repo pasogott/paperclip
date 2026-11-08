@@ -10,8 +10,17 @@ import { readProcessStartedAt } from "./hot-restart.js";
  */
 export type ControllerProcess = { bootId: string; pid: number; hostHash: string; processStartedAt: string | null };
 
+/**
+ * The one boot id of this server process. Native coordinator claims
+ * (`native_run_finalizations.controller_boot_id`), legacy controller leases
+ * (`heartbeat_runs.controller_boot_id`), sandbox creation intents and teardown
+ * claims all stamp this value, so "owned by this process" means the same thing
+ * in every table. Records written by an older release carry that release's
+ * random per-module ids; those never equal this value, exactly as a record
+ * from any earlier boot never did.
+ */
 const bootId = randomUUID();
-const UNKNOWN_PROCESS_SPACE = "unknown";
+export const UNKNOWN_PROCESS_SPACE = "unknown";
 
 /**
  * Names the space in which PIDs are comparable: one kernel boot and, on Linux,
@@ -38,9 +47,9 @@ function processSpaceHash(): string {
 }
 
 const hostHash = processSpaceHash();
-let processStartedAt: Promise<string | null> | undefined;
 
-async function observedProcessStartedAt(pid: number): Promise<number | null> {
+/** OS-observed start time of any PID (epoch ms), or null when it cannot be read. */
+export async function observedProcessStartedAt(pid: number): Promise<number | null> {
   try {
     const startedAt = Date.parse(await readProcessStartedAt(pid) ?? "");
     return Number.isFinite(startedAt) ? startedAt : null;
@@ -49,14 +58,53 @@ async function observedProcessStartedAt(pid: number): Promise<number | null> {
   }
 }
 
+// This process's own start time never changes, so it is read from the OS once.
+// On macOS the read runs `ps -o lstart`; uncached, it ran on every native
+// claim, preparation check and lease renewal. A failed read is not cached, so
+// a transient failure is retried by the next caller.
+let ownStartedAt: Promise<number | null> | undefined;
+/** The start time from the last resolved read, for `currentControllerProcessStamp`. */
+let resolvedProcessStartedAt: string | null = null;
+
+/** OS-observed start time of this server process (epoch ms), read at most once
+ * successfully per process. Null when the OS cannot report it. */
+export function currentProcessStartedAtMs(): Promise<number | null> {
+  if (!ownStartedAt) {
+    const read = observedProcessStartedAt(process.pid);
+    ownStartedAt = read;
+    void read.then(value => {
+      if (value === null && ownStartedAt === read) ownStartedAt = undefined;
+      // Any resolved read also feeds the no-I/O stamp.
+      if (value !== null) resolvedProcessStartedAt = new Date(value).toISOString();
+    });
+  }
+  return ownStartedAt;
+}
+
+/** Test seam: forget the cached start time so a test can stub the OS read. */
+export function resetCurrentProcessStartedAtForTests(): void {
+  ownStartedAt = undefined;
+}
+
 export function currentControllerBootId(): string {
   return bootId;
 }
 
 export async function currentControllerProcess(): Promise<ControllerProcess> {
-  processStartedAt ??= observedProcessStartedAt(process.pid)
-    .then(value => value === null ? null : new Date(value).toISOString());
-  return { bootId, pid: process.pid, hostHash, processStartedAt: await processStartedAt };
+  const startedAt = await currentProcessStartedAtMs();
+  const iso = startedAt === null ? null : new Date(startedAt).toISOString();
+  resolvedProcessStartedAt = iso;
+  return { bootId, pid: process.pid, hostHash, processStartedAt: iso };
+}
+
+/**
+ * This process's identity without any I/O, for stamps written on the turn
+ * path. The start time is present only once an earlier call resolved it. A
+ * stamp without one still proves exit when its PID is gone in this PID space;
+ * a live PID then stays ambiguous, which fails closed.
+ */
+export function currentControllerProcessStamp(): ControllerProcess {
+  return { bootId, pid: process.pid, hostHash, processStartedAt: resolvedProcessStartedAt };
 }
 
 export function readControllerProcess(value: unknown): ControllerProcess | null {
@@ -105,8 +153,25 @@ export function processStartsDefinitelyDiffer(
 export async function controllerProcessExited(controller: ControllerProcess): Promise<boolean> {
   if (controller.bootId === bootId || hostHash === UNKNOWN_PROCESS_SPACE || controller.hostHash !== hostHash) return false;
   if (!processExists(controller.pid)) return true;
+  // Without a recorded start time a live PID can never prove exit; skip the probe.
+  if (!Number.isFinite(Date.parse(controller.processStartedAt ?? ""))) return false;
   // The PID now belongs to a live process, possibly this restarted server.
   // Only a definitely different start time proves the recorded process is gone.
   const observed = await observedProcessStartedAt(controller.pid);
   return observed !== null && processStartsDefinitelyDiffer(controller.processStartedAt, new Date(observed));
+}
+
+/** This process's PID-space hash. An unreadable space is stored as
+ * "unknown", which `sameProcessSpace` never accepts. */
+export function currentProcessSpaceHash(): string {
+  return hostHash;
+}
+
+/**
+ * Whether a PID recorded under `recorded` can be judged in this process.
+ * True only for the same readable PID space. A different or unreadable space
+ * is never proof: a dead PID here says nothing about a process elsewhere.
+ */
+export function sameProcessSpace(recorded: string | null | undefined): boolean {
+  return typeof recorded === "string" && hostHash !== UNKNOWN_PROCESS_SPACE && recorded === hostHash;
 }

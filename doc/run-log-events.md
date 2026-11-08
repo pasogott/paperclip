@@ -87,6 +87,28 @@ not qualify. No deliverable text means no timing sample. A recovered dispatch ca
 record newly committed output from the original start; it does not reproduce
 earlier output timing. The event contains no text or provider identifiers.
 
+## Speed budget breaches
+
+`run.performance.budget_exceeded` (schema `paperclip.run-performance-budget.v1`,
+level `warn`) records one native run that exceeded its p95 speed budget. The
+budgets come from the Phase 0 local baseline and are listed in
+`doc/plans/2026-11-07-durable-ownership-and-reconciliation.md` ("Speed budgets").
+`metric` is `ttft` (`task.time_to_first_token`), `agent_boot` (end of
+`heartbeat.queue` to the end of `runner.turn.submit` or `runner.session.resume`)
+or `restart_recovery` (startup recovery `ready` to the recovered run's first
+provider event). The payload names `adapter` (`codex`, `claude` or `opencode`),
+`environment` (`local`), `startKind` (`cold`, `warm` or `unknown`; an unknown
+start uses the looser budget), `measuredMs`, `budgetP50Ms`, `budgetP95Ms`,
+`percentile` (`p95`), `baseline`, and, for restart recovery, `disposition`.
+For `ttft`, `measuredMs` counts from run creation: when the input waited for its
+run to exist (for example a comment posted while the previous turn was still
+running), that wait is excluded from the judgment and reported as `inputWaitMs`.
+Each metric is checked at most once per dispatch. A restart-recovery dispatch is
+judged only on `restart_recovery`, because its TTFT and boot span the outage. Remote runs and other adapters have
+no budget yet. The event is written in detached diagnostic work after the
+measurement, so it adds no wait before `turn.start`. It is a run-log row only
+and never goes to Telemetry.
+
 The existing `run.performance.span` event also records `provider_pack.select`,
 `provider_pack.discover`, `provider_pack.verify`, `provider_pack.verify_preinstalled`,
 `provider_pack.link_preinstalled`, `provider_pack.clear_stale`, `provider_pack.upload`,
@@ -98,6 +120,30 @@ Harness startup also records `harness_state.inspect`, `harness_state.path_check`
 and `harness_state.launch_material` for remote state inspection and fresh launch
 material. These events retain the existing schema and carry no paths or exception strings.
 They also become native Observability spans only with an operator OTLP endpoint.
+
+## Local runner startup sub-steps
+
+`run.performance.span` splits a local Runner startup (`runner.session.bootstrap` or
+`runner.session.resume`) into three sequential children of `runner.session.startup`:
+
+- `runner.runtime.stage`: controller-side launch preparation before the Runner
+  process exists (runtime context, provider home, launch profiles; on resume, the
+  durable-state checks and authority rotation as well).
+- `runner.process.launch`: from spawning `paperclip-runnerd` until its first
+  authenticated connection to the PRP control plane. An exact adoption of a live
+  Runner records no launch, so this span keeps meaning a fresh Runner process
+  (see startup reuse above).
+- `provider.session.load`: from that authentication until the provider session
+  identity is confirmed. It covers `run.prepare` and `session.open`, or on resume
+  the `run.attach` that restores the provider and the recovery probe.
+
+Each carries `mode` (`bootstrap` or `resume`), `target: "local"`, and `outcome`
+(`failed` when startup fails inside the step). The Runner transport reports each
+milestone synchronously; the controller writes the row as deferred diagnostic
+work, so the run-log write never delays `turn.start`. Remote launchers keep their
+own `runner.runtime.stage` and `runner.process.launch` spans. These rows stay in
+the instance run log; with an operator OTLP endpoint they are also Observability
+spans. They are not Telemetry.
 
 ## Native PRP Run-Log Events
 
