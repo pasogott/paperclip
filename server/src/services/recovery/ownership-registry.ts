@@ -34,6 +34,7 @@ import {
 import { settleClaimedWakeRequest } from "./wake-request-claimed-settlement.js";
 import { settleAbandonedWorkspaceFinalizeAttempt } from "./workspace-finalize-attempt-settlement.js";
 import { nativeControllerOwnerStamp, runProcessOwnerStamp } from "../native-runtime/native-owner-stamps.js";
+import { settleIssueLock } from "./issue-lock-settlement.js";
 import { legacyControllerOwnerStamp, settleLegacyControllerLease } from "../legacy-controller-lease.js";
 import {
   nativeLeaseHolderStamp,
@@ -56,6 +57,8 @@ import {
   releasableRetainedOrphanCondition,
   settleRetainedOrphanSandbox,
 } from "../environment-retained-orphan-settlement.js";
+import { settleExecutionWorkspaceRuntimeLease } from "../workspace-runtime-lease-settlement.js";
+import { parseWorkspaceRuntimeLeaseOwnerKey } from "../workspace-runtime-leases.js";
 
 /**
  * Registry of ownable record kinds (plan section C).
@@ -81,6 +84,8 @@ export type RecordOwner =
   | { kind: "fence"; stamp: RemoteOwnerStamp; fence: RemoteFenceState }
   /** A run id only. The record's owner is that run's execution. */
   | { kind: "run"; runId: string }
+  /** An issue id only. Gone when the issue is missing, hidden or terminal. */
+  | { kind: "issue"; issueId: string }
   /** A person or agent assignment, such as an operator-owned recovery action. */
   | { kind: "operator"; ownerType: string | null }
   /** A durable work queue that acts on the record by its saved deadline. The
@@ -511,6 +516,21 @@ function spoolKind(id: string, title: string, obligation: Obligation, directory:
 }
 
 // ----------------------------------------------------------------------------
+// execution_workspace_runtime_leases
+
+/** The lease's owner key names its owner: an issue or run is proven by
+ * identity; an agent-scoped (or unparseable) owner is a fence on the lease
+ * expiry that only a claim's locked takeover moves. */
+function runtimeLeaseOwner(row: typeof executionWorkspaceRuntimeLeases.$inferSelect): RecordOwner {
+  const owner = parseWorkspaceRuntimeLeaseOwnerKey(row.ownerKey);
+  if (owner?.kind === "issue") return { kind: "issue", issueId: owner.id };
+  if (owner?.kind === "run") return { kind: "run", runId: owner.id };
+  return { kind: "fence", stamp: { kind: "remote", scope: "execution_workspace_runtime_lease", generation: null,
+    fenceToken: row.ownerKey }, fence: { currentFenceToken: row.ownerKey, currentGeneration: null,
+    leaseExpiresAt: row.expiresAt } };
+}
+
+// ----------------------------------------------------------------------------
 // The registry
 
 export const OWNABLE_KINDS: readonly OwnableKind[] = [
@@ -714,15 +734,18 @@ export const OWNABLE_KINDS: readonly OwnableKind[] = [
     and(eq(workspaceOperations.phase, "remote_workspace_migration"), eq(workspaceOperations.status, "running")),
     () => ({ kind: "none" })),
   {
+    // Shared path since Phase 2: a lease whose issue or run owner is proven
+    // gone (by identity, never age) is released here and at the next claim.
+    // An agent-scoped owner is a fence on `expires_at`: alive while held,
+    // unprovable after; only the next claim's locked takeover moves it.
     id: "execution_workspace_runtime_lease", title: "Execution workspace runtime lease", obligation: "ownership",
-    storage: "database", settle: null, invariantChecks: [1, 2],
+    storage: "database", settle: settleExecutionWorkspaceRuntimeLease, invariantChecks: [1, 2],
     listInProgress: async (db, limit, offset) => {
       const rows = await db.select().from(executionWorkspaceRuntimeLeases).orderBy(asc(executionWorkspaceRuntimeLeases.id)).limit(limit + 1).offset(offset);
       const result = page(rows, limit);
       return { truncated: result.truncated, records: result.rows.map(row => ({
         recordId: row.id, companyId: row.companyId, runId: row.ownerRunId, issueId: row.ownerIssueId,
-        owner: row.ownerRunId ? runOwner(row.ownerRunId) : { kind: "operator", ownerType: row.ownerKey.split(":")[0] ?? null },
-        updatedAt: row.updatedAt,
+        owner: runtimeLeaseOwner(row), updatedAt: row.updatedAt,
       })) };
     },
   },
@@ -892,7 +915,7 @@ export const OWNABLE_KINDS: readonly OwnableKind[] = [
     [2]),
   {
     id: "issue_execution_lock", title: "Issue execution lock", obligation: "ownership", storage: "database",
-    settle: null, invariantChecks: [2, 3, 7],
+    settle: settleIssueLock, invariantChecks: [2, 3, 7],
     listInProgress: async (db, limit, offset) => {
       const rows = await db.select({ id: issues.id, companyId: issues.companyId, runId: issues.executionRunId,
         updatedAt: issues.updatedAt }).from(issues).where(isNotNull(issues.executionRunId)).orderBy(asc(issues.id)).limit(limit + 1).offset(offset);
@@ -905,7 +928,7 @@ export const OWNABLE_KINDS: readonly OwnableKind[] = [
   },
   {
     id: "issue_checkout_lock", title: "Issue checkout lock", obligation: "ownership", storage: "database",
-    settle: null, invariantChecks: [2, 7],
+    settle: settleIssueLock, invariantChecks: [2, 7],
     listInProgress: async (db, limit, offset) => {
       const rows = await db.select({ id: issues.id, companyId: issues.companyId, runId: issues.checkoutRunId,
         updatedAt: issues.updatedAt }).from(issues).where(isNotNull(issues.checkoutRunId)).orderBy(asc(issues.id)).limit(limit + 1).offset(offset);
