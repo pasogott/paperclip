@@ -1000,8 +1000,20 @@ describe("chat prompt policy", () => {
     expect(AGENT_CHAT_DIRECTIVE).toContain("do not look for others in package registries, repositories or the web");
     expect(AGENT_CHAT_DIRECTIVE).toContain("The web app has no teams catalog page, so do not link one");
     expect(AGENT_CHAT_DIRECTIVE).toContain("paperclipai teams install <team id> --company-id <companyId>");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("When you recommend a team, name its roles (agentSlugs), every required skill (requiredSkills, by its ref) and every configuration input (envInputs)");
     const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: "RUN-1", title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
     expect(prompt).toContain("GET /api/teams/catalog");
+  });
+
+  it("tells chat to answer terminal requests with the person's own CLI commands", () => {
+    expect(AGENT_CHAT_DIRECTIVE).toContain("they mean their own terminal: give them commands using the Paperclip CLI, npx paperclipai");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("instead of doing the work yourself, saving a file in your workspace or writing curl");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("Fill in values you can read here, such as this company's id");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("Write the Paperclip address as <your Paperclip URL>");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("npx paperclipai run cancel <runId> stops a queued or running one (board users only)");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("a command whose output is piped cannot open the sign-in prompt");
+    const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: "RUN-1", title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
+    expect(prompt).toContain("npx paperclipai issue document:get <task id or identifier> <key> --json | jq -r .body > <file name>");
   });
 
   it("tells chat where a person can hire when the agent cannot", () => {
@@ -1021,6 +1033,16 @@ describe("chat prompt policy", () => {
     expect(AGENT_CHAT_DIRECTIVE).toContain("Never build a prefix from the company name");
     const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: "RUN-1", title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
     expect(prompt).toContain("for task RUN-1 the prefix is RUN");
+  });
+
+  it("sends a task-tree pause to the person's Pause subtree control instead of imitating it with task edits", () => {
+    expect(AGENT_CHAT_DIRECTIVE).toContain("Pausing, stopping or resuming a whole task tree (a parent task and all of its subtasks) is a person's control, not an agent action.");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("chooses More task actions, then Pause subtree");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("do not change task statuses or assignees, cancel runs, pause agents, or create tasks or routines to resume it later");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("Paperclip has no scheduled resume");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("[<identifier>](/<prefix>/issues/<identifier>)");
+    const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: "RUN-1", title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
+    expect(prompt).toContain("then Pause subtree");
   });
 
   it("asks which record is meant before changing one of several matches", () => {
@@ -1055,6 +1077,15 @@ describe("chat prompt policy", () => {
     expect(AGENT_CHAT_DIRECTIVE).toContain("read the agent and name it rather than showing a raw ID");
     const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: null, title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
     expect(prompt).toContain("/<prefix>/agents/<agentId>/runs/<runId>");
+  });
+
+  it("says the task-chat lab exists only under pnpm dev in the person's own checkout", () => {
+    expect(AGENT_CHAT_DIRECTIVE).toContain("Some developer labs, including the task-chat interaction lab at /<prefix>/dev/task-chat-lab, are registered only in a development build of the UI");
+    expect(AGENT_CHAT_DIRECTIVE).not.toContain("Developer labs, such as");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("the design guide and the ux-lab pages, are registered in every build");
+    expect(AGENT_CHAT_DIRECTIVE).toContain("running pnpm dev in their own Paperclip checkout and visiting /<prefix>/dev/task-chat-lab");
+    const prompt = buildPaperclipTaskMarkdown({ issue: { id: "chat", identifier: null, title: "Chat", workMode: "ask", conversationAgentId: "agent" } });
+    expect(prompt).toContain("/<prefix>/dev/task-chat-lab");
   });
 
   it("routes a person's own profile change to their profile settings instead of an agent write", () => {

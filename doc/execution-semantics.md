@@ -612,6 +612,17 @@ failing setup. The save's retry budget bounds that wait. A save that exhausts
 its retries is handed to the board as a named recovery action. After that hand-off,
 the cutoff no longer advances.
 
+Automatic wakes do not run into a hold that preparation would refuse. A parent or
+dependent woken because a child or blocker stalled on the board
+(`issue_blocker_stalled`) is not woken again when its assignee's last run on the
+task failed setup on its bound workspace's hold and that hold is still past the
+cutoff, or held by a writer that cannot be named: another run could only fail
+the same way. The wake is delivered once the hold settles or the task changes
+assignee, and the sweep checks again at most hourly. Failed runs that carry a
+stall, including resource-wait retries of its wake, are retried after ten
+minutes, then twenty, and not after the third failed run. The stall stays
+listed on the waiting task, and a new stall wakes it again.
+
 An instance admission drain keeps accepted new turns queued and displays
 **Waiting for maintenance**. Ending the audited drain requests admission for
 these existing runs immediately. The shared delivery coordinator owns the drain's
@@ -1568,6 +1579,24 @@ It records an `inherited_runner_never_launched` lifecycle event. Any other run,
 and any run saved by an older release without these facts, keeps verified
 reattachment. A reattachment that loses its runner still requests the user's
 Retry as described above.
+
+A local runnerd that dies (for example SIGKILL during a tool call) cannot
+suspend, and its provider and tool processes are re-parented, so they cannot be
+found from the controller's process records. Durable runnerd therefore journals
+each provider's process lineage to `<runner state>/process-lineage/` from the
+moment the provider is spawned: the provider, every descendant, and every
+process group or session a descendant leads, each named by PID and start time.
+When close finds that runnerd exited without suspending and without a signal
+from close, it runs `paperclip-runnerd reap-lineage` from the same executable.
+The reaper refuses while runnerd is alive or when runnerd never journalled. It
+signals only processes whose PID and start time still match the journal, and it
+reports `verified` only when none remain. The journal also records how far the
+process table was read. A same-user orphan that started after that point cannot
+be attributed, so the reaper refuses without signalling it. A failed journal write removes the writer marker, so a
+record that may be missing a member never verifies. A verified report ends the session as
+a crash stop with its durable record intact, and recovery continues within the
+normal attempt budget. Any other report keeps the cleanup quarantine below.
+Launcher-owned (remote) and adopted runners are not reaped this way.
 
 When a native attempt fails before launch because its predecessor's session is
 quarantined, explicit task Retry verifies the retained journal's actual owner.
@@ -2778,6 +2807,33 @@ for that allocation. Restore requires one final owner and the existing matching
 predecessor/successor receipts for every earlier owner. Unrelated, live, or
 incompletely linked owners remain ambiguous. The run then fails closed
 with `runner_harness_state_mismatch: backup_without_reusable_lease`.
+
+A workspace-restore hold also takes a warm sandbox out of reuse. When a run
+that holds a warm lease ends with a workspace-restore failure, the hold stops
+the sandbox under a stop-and-retain receipt, changes the lease policy to
+`retain_on_failure`, and records a `workspaceRestoreRecovery` marker with the
+original policy. Workspace recovery then saves the files. In the transaction
+that completes that recovery, Paperclip returns the lease to
+`reuse_by_environment` only when all of these are true: the original policy
+was `reuse_by_environment` (or, for a marker saved by an older release, the
+lease carries its reusable-lease scope), the recovery is complete with a
+saved-file receipt from this allocation, the stop receipt is confirmed with
+state `stopped`, no unsaved writer or pending native workspace export is bound
+to the allocation, the run's recorded disposition is not `destroy`, and the
+allocation has one verified owner chain. The update is a compare-and-swap on
+the checked row. It moves the marker to `workspaceRestoreRecoverySettled`, so
+the next run resumes the warm sandbox. A hold that fails any condition keeps
+its protection.
+
+Older releases left settled holds in `retain_on_failure`, and reuse never
+selects that policy. For those rows, the hold's lease also counts as a retired
+backup source when all of these are true: the lease is `released` with policy
+`retain_on_failure`, it has a `workspaceRestoreRecovery` marker for its own
+run, it has a confirmed stop-and-retain receipt with state `stopped`, and no
+unsaved writer or pending native workspace export is bound to it. The backup
+stamp, single-owner, and later-provider-work checks above still apply. A
+stopped lease that is still `reuse_by_environment` remains ambiguous and fails
+closed.
 
 A Runner close can also fail to prove suspension after the control plane
 accepted the run's result (`native.post_result_failure` with category
