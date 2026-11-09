@@ -5612,6 +5612,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (!isSafeNativeStateDirectory(quarantine)) return refuse("quarantine_unsafe");
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
+      if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
       const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
@@ -5625,6 +5626,15 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     return null;
   };
   return { finished: true, run: prior.run, recheck };
+}
+
+export function quarantinedBootstrapOfOwnerHeldNoProviderWork(root: string, identity: Record<string, string>,
+  localRunner: boolean): boolean {
+  if (!isSafeNativeStateDirectory(root)) return false;
+  const copied = readRunnerdDurableIdentity(root);
+  if (!copied || Object.entries(identity).some(([key, value]) => copied[key] !== value)) return false;
+  return runnerdStateProvesIncompleteBootstrap(root, { localProcesses: localRunner })
+    || (!localRunner && runnerdStateProvesNoRemoteProviderTurn(root));
 }
 
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
@@ -6464,7 +6474,9 @@ async function verifyStagedAttachmentRestart(input: {
   const target = input.runnerExecutionTarget;
   if (input.restartRecovery?.kind !== "reattach_remote_runner" || input.restartRecovery.remote.kind === "plugin_task" ||
       target?.kind !== "remote" || target.transport !== "sandbox" || target.runnerTask ||
-      target.sandboxLeaseAcquisition?.outcome !== "resumed") return deny();
+      target.sandboxLeaseAcquisition?.outcome === "replacement" ||
+      input.restartRecovery.remote.providerLeaseId !== target.sandboxLeaseAcquisition?.providerLeaseId ||
+      input.restartRecovery.remote.remoteCwd !== target.remoteCwd) return deny();
   const [current] = await input.db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, input.execution.binding.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     eq(heartbeatRuns.agentId, input.execution.binding.agentId), eq(heartbeatRuns.nativeIssueId, input.execution.binding.issueId)));
