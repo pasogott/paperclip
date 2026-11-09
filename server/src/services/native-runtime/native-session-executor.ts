@@ -5429,7 +5429,7 @@ type SettledRunnerdProjection = { bytes: string; refused?: never } | { bytes?: n
 const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain", "runner.shutdown"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
@@ -5449,7 +5449,7 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     const control = record(JSON.parse(bytes));
     const commands = (Array.isArray(control.commands) ? control.commands : []).map(record);
     // A stopped local Runner can no longer act on its own lifecycle commands.
-    const settledCommands = options.localRunner && lifecycle === "not_suspended" && Array.isArray(control.commands)
+    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone) && Array.isArray(control.commands)
       ? commands.filter(command => !LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type)) || command.status === "completed")
       : commands;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
@@ -5553,11 +5553,16 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   let originalBytes: string;
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes };
+  const { binding } = input.execution;
+  const remoteRunnerGone = !localRunner && await priorRemoteSandboxLeasesEnded(input.db, {
+    companyId: binding.companyId, runId: identity.runId,
+    currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
+      ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
+  });
+  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   if (projection.refused !== undefined) return refuse(projection.refused);
   const controlBytes = projection.bytes;
-  const { binding } = input.execution;
   let prior: { run: typeof heartbeatRuns.$inferSelect; owner: typeof nativeRunFinalizations.$inferSelect } | undefined;
   try {
     [prior] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
@@ -5619,7 +5624,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner });
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
   }
@@ -5643,6 +5648,20 @@ export function quarantinedBootstrapOfOwnerHeldNoProviderWork(root: string, iden
     || (!localRunner && runnerdStateProvesNoRemoteProviderTurn(root));
 }
 
+async function priorRemoteSandboxLeasesEnded(db: Db, input: {
+  companyId: string; runId: string; currentProviderLeaseId?: string;
+}): Promise<boolean> {
+  try {
+    const leases = await db.select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt,
+      providerLeaseId: environmentLeases.providerLeaseId }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.runId)));
+    return leases.length > 0 && leases.every(lease => (lease.status === "released" || lease.status === "expired")
+      && lease.releasedAt !== null && lease.providerLeaseId !== input.currentProviderLeaseId);
+  } catch {
+    return false;
+  }
+}
+
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
   : Promise<{ retired: true } | { retired: false; refused: string }> {
   const proof = await inspectFinishedPerTurnRunnerdOwner(input);
@@ -5661,8 +5680,34 @@ async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspec
   return { retired: true };
 }
 
-function undeliveredAttachRotationSource(root: string, execution: NativeExecutionInput): string | null {
+function latestSuspendedArchivedEpoch(root: string, matches: (prior: Record<string, unknown>) => boolean): string | null {
+  const archives = resolve(root, "authority-epochs");
+  if (!isSafeNativeStateDirectory(archives)) return null;
+  const candidates = readdirSync(archives).map(name => resolve(archives, name)).filter(epoch => {
+    const state = resolve(epoch, "control-plane", "control-plane-state.json");
+    return isSafeNativeStateDirectory(epoch) && existsSync(state) && existsSync(resolve(epoch, "runner-state.json"));
+  }).sort((left, right) => lstatSync(resolve(right, "control-plane", "control-plane-state.json")).mtimeMs
+    - lstatSync(resolve(left, "control-plane", "control-plane-state.json")).mtimeMs);
+  const latest = candidates[0];
+  if (!latest) return null;
+  const prior = record(readRunnerdControlPlaneState(latest).identity);
+  const runner = record(JSON.parse(readBoundedNativeFile(resolve(latest, "runner-state.json"),
+    NATIVE_RUNNER_STATE_MAX_BYTES, "runner_state_too_large").toString("utf8")));
+  const digest = createHash("sha256").update(JSON.stringify(prior)).digest("hex").slice(0, 24);
+  if (basename(latest) !== `epoch-${digest}` || !matches(prior) ||
+      runner.schema !== RUNNERD_STATE_SCHEMA || runner.lifecycle !== "suspended" ||
+      ["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId"].some(key => runner[key] !== prior[key])) return null;
+  return latest;
+}
+
+function interruptedRotationSource(root: string, execution: NativeExecutionInput): string | null {
   try {
+    if (existsSync(resolve(root, "runner", "runner-state.json"))) return null;
+    if (!existsSync(resolve(root, "control-plane", "control-plane-state.json"))) {
+      if (existsSync(resolve(root, "control-plane")) && readdirSync(resolve(root, "control-plane")).length > 0) return null;
+      return latestSuspendedArchivedEpoch(root, prior => typeof prior.runId === "string" &&
+        prior.runId !== execution.binding.runId && prior.normalizedSessionId === nativeSessionKey(execution));
+    }
     const control = readRunnerdControlPlaneState(root);
     const identity = record(control.identity);
     const commands = Array.isArray(control.commands) ? control.commands.map(record) : [];
@@ -5674,26 +5719,9 @@ function undeliveredAttachRotationSource(root: string, execution: NativeExecutio
         Object.keys(record(control.commandDeliveryCounts)).length !== 0 ||
         control.warmTransition != null || control.completedWarmTransition != null || control.stagedRunAttachment != null ||
         history.adopted === true || history.credentialsIssued !== 0 ||
-        commands.length !== 1 || commands[0]!.type !== "run.attach" || commands[0]!.status !== "pending" ||
-        existsSync(resolve(root, "runner", "runner-state.json"))) return null;
-    const archives = resolve(root, "authority-epochs");
-    if (!isSafeNativeStateDirectory(archives)) return null;
-    const candidates = readdirSync(archives).map(name => resolve(archives, name)).filter(epoch => {
-      const state = resolve(epoch, "control-plane", "control-plane-state.json");
-      return isSafeNativeStateDirectory(epoch) && existsSync(state) && existsSync(resolve(epoch, "runner-state.json"));
-    }).sort((left, right) => lstatSync(resolve(right, "control-plane", "control-plane-state.json")).mtimeMs
-      - lstatSync(resolve(left, "control-plane", "control-plane-state.json")).mtimeMs);
-    const latest = candidates[0];
-    if (!latest) return null;
-    const prior = record(readRunnerdControlPlaneState(latest).identity);
-    const runner = record(JSON.parse(readBoundedNativeFile(resolve(latest, "runner-state.json"),
-      NATIVE_RUNNER_STATE_MAX_BYTES, "runner_state_too_large").toString("utf8")));
-    const digest = createHash("sha256").update(JSON.stringify(prior)).digest("hex").slice(0, 24);
-    if (basename(latest) !== `epoch-${digest}` || prior.runId === identity.runId ||
-        ["runnerInstanceId", "environmentLeaseId", "normalizedSessionId"].some(key => prior[key] !== identity[key]) ||
-        runner.schema !== RUNNERD_STATE_SCHEMA || runner.lifecycle !== "suspended" ||
-        ["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId"].some(key => runner[key] !== prior[key])) return null;
-    return latest;
+        commands.length !== 1 || commands[0]!.type !== "run.attach" || commands[0]!.status !== "pending") return null;
+    return latestSuspendedArchivedEpoch(root, prior => prior.runId !== identity.runId &&
+      ["runnerInstanceId", "environmentLeaseId", "normalizedSessionId"].every(key => prior[key] === identity[key]));
   } catch {
     return null;
   }
@@ -5702,13 +5730,15 @@ function undeliveredAttachRotationSource(root: string, execution: NativeExecutio
 async function rollBackUndeliveredAttachRotation(root: string, execution: NativeExecutionInput,
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>): Promise<void> {
   if (!existsSync(root) || !isSafeNativeStateDirectory(root)) return;
-  const epoch = undeliveredAttachRotationSource(root, execution);
+  const epoch = interruptedRotationSource(root, execution);
   if (!epoch) return;
   const archivedAt = Date.now();
-  const breakRoot = resolve(root, "continuity-breaks", `${archivedAt}-${randomUUID()}`);
-  mkdirSync(breakRoot, { recursive: true, mode: 0o700 });
   noteNativeRunnerEvidence(archivedAt);
-  renameSync(resolve(root, "control-plane"), resolve(breakRoot, "control-plane"));
+  if (existsSync(resolve(root, "control-plane"))) {
+    const breakRoot = resolve(root, "continuity-breaks", `${archivedAt}-${randomUUID()}`);
+    mkdirSync(breakRoot, { recursive: true, mode: 0o700 });
+    renameSync(resolve(root, "control-plane"), resolve(breakRoot, "control-plane"));
+  }
   mkdirSync(resolve(root, "runner"), { recursive: true, mode: 0o700 });
   renameSync(resolve(epoch, "runner-state.json"), resolve(root, "runner", "runner-state.json"));
   renameSync(resolve(epoch, "control-plane"), resolve(root, "control-plane"));
@@ -5779,9 +5809,8 @@ async function migrateRunnerdStateRootForExecution(input: {
     }
     const identity = readRunnerdDurableIdentity(scoped);
     if (!identity && input.restartRecovery?.kind === "bootstrap_incomplete" &&
-        (!input.runnerExecutionTarget || input.runnerExecutionTarget.kind === "local") &&
         !existsSync(resolve(scoped, "control-plane", "control-plane-state.json")) &&
-        await noLocalRunnerProcessForRun(input.execution.binding.runId)) {
+        (input.runnerExecutionTarget?.kind === "remote" || await noLocalRunnerProcessForRun(input.execution.binding.runId))) {
       // The server was killed between creating the root and the local runner's
       // first state write. No runner for the run is alive on this host and none
       // connected, so no provider started and no command was acknowledged.
@@ -6725,9 +6754,14 @@ async function restorePerTurnRunnerdController(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
 }): Promise<void> {
-  if (input.restartRecovery || input.runnerExecutionTarget?.kind !== "remote" ||
+  if ((input.restartRecovery && input.restartRecovery.kind !== "bootstrap_incomplete") ||
+      input.runnerExecutionTarget?.kind !== "remote" ||
       input.execution.session.lifecyclePolicy.mode !== "per_turn") return;
   const root = scopedRunnerdStateRoot(input.execution);
+  if (input.restartRecovery) {
+    const prior = readRunnerdDurableIdentity(root) ?? readRunnerdDurableIdentity(root, true);
+    if (!prior || prior.runId === input.execution.binding.runId) return;
+  }
   await restoreDurableHarnessForExecution(input.db, input.execution, root);
   const identity = readRunnerdDurableIdentity(root);
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
@@ -14870,8 +14904,8 @@ async function createRunnerdBackendWithinSessionClaim(
         stateDirectory: root, runnerBinary: remoteDot?.runnerBinary ?? resolvePaperclipRunnerBinary(),
         runnerArtifact: input.controllerPersistence?.runnerArtifact,
         runnerReconnectGraceMs: remoteDot ? REMOTE_RUNNER_RECONNECT_GRACE_MS : undefined,
-        recoverSemanticToolInput: input.controllerPersistence ? (call: { operationId: string; callId: string; input: unknown }) =>
-          authorityEpoch.recover({ tool: call.operationId, callId: call.callId, arguments: call.input }) : undefined,
+        recoverSemanticToolInput: (call: { operationId: string; callId: string; input: unknown }) =>
+          authorityEpoch.recover({ tool: call.operationId, callId: call.callId, arguments: call.input }),
         ...(remoteDot ?? {}),
         identity: { runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId: effectiveEnvironmentLeaseId,
           runId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
@@ -16465,11 +16499,11 @@ async function createRunnerdBackendWithinSessionClaim(
         stateDirectory: root,
         runnerBinary: controllerRunnerBinary,
         runnerArtifact: input.controllerPersistence?.runnerArtifact ?? providerPackAuthority?.runnerArtifact,
-        recoverSemanticToolInput: input.controllerPersistence ? call => {
+        recoverSemanticToolInput: call => {
           const current = sessionToolAuthorityEpochs.get(sessionScopeId);
           if (!current || current.runId !== call.correlation.runId) throw new Error("native_tool_authority_epoch_revoked");
           return current.recover({ tool: call.operationId, callId: call.callId, arguments: call.input });
-        } : undefined,
+        },
         codexCommand: remoteCodexBinary ?? undefined,
         sourceCodexHome: remoteTarget
           ? resolveSourceCodexHome(resolveNativeProviderEnvironment(input.execution.provider, runnerEnvironment))
