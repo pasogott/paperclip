@@ -122,8 +122,8 @@ original-volume anchor or filesystem read. These validations add bounded
 per-retained-scope database reads during startup. They do not add a worker or a
 poll. Missing or invalid byte evidence remains an enrollment blocker.
 
-The original-volume owner can refresh a WEB receipt whose database facts digest
-has become stale only when fresh source inspection, current-key checkpoint
+The original-volume owner can refresh a WEB or full native receipt whose database
+facts digest has become stale only when fresh source inspection, current-key checkpoint
 validation and ciphertext hash/size readback prove the preserved bindings unchanged.
 It reuses the same archive and takes the existing finalizer, task and run fences before
 comparing the prior receipt digest and replacing it. The company activity log
@@ -133,6 +133,10 @@ the exact prior proof from the unchanged current bindings before publication. No
 enter the audit delta; normal activity redaction remains enabled. Changed
 evidence, concurrent invalid receipts and active sources remain blocked; remote
 recovery obligations are unchanged.
+Full native reproof still requires canonical destroyed-provider receipts. A
+database-only legacy workspace migration marker can stale the facts digest while
+the preserved controller, skill assets and local byte proof remain unchanged;
+refresh authenticates that same object and does not upload a replacement archive.
 
 Local inode and timestamp observations may change between preservation attempts
 without changing byte coverage. Valid receipts remain idempotent after those
@@ -144,6 +148,18 @@ still invalidate preservation evidence.
 Receipt validation adds bounded per-scope database reads to startup eligibility.
 It does not add a recurring scan or network work. Qualification must measure the
 selected cohort's startup latency on the serving revision before enrollment.
+
+### Workspace cohort admission proofs
+
+A saved cohort keeps its exact members, operations and snapshots on resume.
+Independent companion imports can change the current source-scope proof without
+changing those members. When every member has a running journal and its current
+fingerprint matches both saved fingerprints, the importer can reprove the current
+scope under fresh source, lifecycle and finalizer locks. After current source and
+recovery checks, one transaction compares every journal and refreshes only the
+cohort proof for all members. Cancellation or a changed journal rolls back the
+whole refresh. Partial reservations still require the original aggregate proof.
+Archives, recovery obligations and publication checks retain their existing owners.
 
 ### Original local Git sources for archived workspaces
 

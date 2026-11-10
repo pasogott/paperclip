@@ -59,14 +59,21 @@ const gitSourceProof = (source: ArchivedGitMigrationSource | null) => source ? {
   ...(source.retainedBranch ? { retainedBranch: source.retainedBranch } : {}),
 } : null;
 
-async function isUnmaterializedRepositoryRequest(workspace: Workspace,
-  repository: typeof executionWorkspaceRepositories.$inferSelect) {
+type RepositoryRequest = typeof executionWorkspaceRepositories.$inferSelect;
+
+function isUnmaterializedRepositoryCandidate(repository: RepositoryRequest) {
   const unprepared = repository.state === "pending" && !repository.failureCode
     || repository.state === "needs_repair" && repository.failureCode === "repository_preparation_failed";
-  if (!workspace.cwd || !unprepared || repository.pinnedCommit || repository.branchName) return false;
+  if (!unprepared || repository.pinnedCommit || repository.branchName) return false;
   const relative = repository.relativePath;
   if (!relative || relative.includes("\\") || path.posix.isAbsolute(relative)
     || path.posix.normalize(relative) !== relative || relative.split("/").some(part => !part || part === "." || part === "..")) return false;
+  return true;
+}
+
+async function isUnmaterializedRepositoryRequest(workspace: Pick<Workspace, "cwd">, repository: RepositoryRequest) {
+  if (!workspace.cwd || !isUnmaterializedRepositoryCandidate(repository)) return false;
+  const relative = repository.relativePath;
   const root = await fs.lstat(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -88,6 +95,13 @@ async function isUnmaterializedRepositoryRequest(workspace: Workspace,
   });
 }
 
+async function assertArchivedRepositoryIntents(root: string, repositories: readonly RepositoryRequest[]) {
+  for (const repository of repositories) {
+    if (!await isUnmaterializedRepositoryRequest({ cwd: root }, repository))
+      throw new Error("remote_workspace_migration_blocked:repository_preparation_unresolved");
+  }
+}
+
 async function inspect(db: ReadDb, input: { companyId: string; workspaceId: string; operationId?: string; writersStopped?: boolean; onlineSource?: OnlineWorkspaceSource; onlineSourceUnproven?: boolean }, cohort?: WorkspaceMigrationCohort) {
   const [workspace] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.workspaceId)));
   if (!workspace) throw new Error("remote_workspace_migration_workspace_missing");
@@ -95,7 +109,7 @@ async function inspect(db: ReadDb, input: { companyId: string; workspaceId: stri
   const marker = object(workspace.metadata?.remoteWorkspaceMigration);
   const allowedOperation = input.operationId ?? (marker.schema === SCHEMA && typeof marker.operationId === "string" ? marker.operationId : undefined);
   const reasons: string[] = [];
-  if (authority) return { workspace, reasons, authority, marker, source: authority.source, issueBinding: null, retainedDirectory: null, archivedGitSource: null, legacyRecoverySources: [] as LegacyWorkspaceRecoverySource[], finalizedRecoveryHolds: [] as FinalizedWorkspaceRecoveryHold[], onlineRecoveryHolds: [] as OnlineRecoveryHold[] };
+  if (authority) return { workspace, reasons, authority, marker, source: authority.source, issueBinding: null, retainedDirectory: null, archivedGitSource: null, legacyRecoverySources: [] as LegacyWorkspaceRecoverySource[], finalizedRecoveryHolds: [] as FinalizedWorkspaceRecoveryHold[], onlineRecoveryHolds: [] as OnlineRecoveryHold[], archivedRepositoryIntents: [] as RepositoryRequest[] };
   if (input.writersStopped) reasons.push(...await offlineWorkspaceMigrationBlockers(db));
   if (input.onlineSourceUnproven) reasons.push("online_workspace_source_scope_unproven");
   if (input.onlineSource) {
@@ -160,7 +174,8 @@ async function inspect(db: ReadDb, input: { companyId: string; workspaceId: stri
     sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' in ('prepared', 'finalized')`,
   ));
   const legacyRecoverySources: LegacyWorkspaceRecoverySource[] = [];
-  const onlineRecoveryAllowed = Boolean(input.onlineSource) && !input.writersStopped;
+  const onlineRecoveryAllowed = !input.writersStopped
+    && Boolean(input.onlineSource || workspace.status === "archived" && archivedGitSource);
   for (const run of referencedRuns.filter(run => object(run.reference).state === "prepared").sort((a, b) => a.id.localeCompare(b.id))) {
     if (onlineRecoveryAllowed) {
       const source = await inspectOnlineLegacyWorkspaceRecoverySource(db, { workspace, runId: run.id });
@@ -300,7 +315,9 @@ async function inspect(db: ReadDb, input: { companyId: string; workspaceId: stri
   legacyRecoverySources.sort((a, b) => a.runId.localeCompare(b.runId));
   const repositories = await db.select().from(executionWorkspaceRepositories).where(and(eq(executionWorkspaceRepositories.companyId, workspace.companyId),
     eq(executionWorkspaceRepositories.executionWorkspaceId, workspace.id)));
+  const archivedRepositoryIntents: RepositoryRequest[] = [];
   for (const repository of repositories.filter(repository => repository.state !== "ready")) {
+    if (archivedGitSource?.recipe && isUnmaterializedRepositoryCandidate(repository)) { archivedRepositoryIntents.push(repository); continue; }
     if ((!input.writersStopped && !input.onlineSource) || !await isUnmaterializedRepositoryRequest(workspace, repository)) reasons.push("repository_preparation_unresolved");
   }
   const source: RemoteWorkspaceSource = workspace.repoUrl ? { kind: "git", repoUrl: workspace.repoUrl,
@@ -308,7 +325,7 @@ async function inspect(db: ReadDb, input: { companyId: string; workspaceId: stri
   const materialized = repositories.filter(repository => repository.state === "ready");
   if (materialized.length) source.repositories = materialized.map(repository => ({ id: repository.id, relativePath: repository.relativePath,
     repoUrl: repository.repoUrl, ref: repository.requestedRef, ...(repository.pinnedCommit ? { pinnedCommit: repository.pinnedCommit } : {}) }));
-  return { workspace, reasons: [...new Set(reasons)], authority, marker, source, issueBinding: issue?.executionWorkspaceId ?? null, retainedDirectory, archivedGitSource, legacyRecoverySources, finalizedRecoveryHolds, onlineRecoveryHolds };
+  return { workspace, reasons: [...new Set(reasons)], authority, marker, source, issueBinding: issue?.executionWorkspaceId ?? null, retainedDirectory, archivedGitSource, legacyRecoverySources, finalizedRecoveryHolds, onlineRecoveryHolds, archivedRepositoryIntents };
 }
 
 export async function inventoryRemoteWorkspaceMigration(db: Db, input: { companyId: string; workspaceId: string; writersStopped?: boolean }) {
@@ -364,7 +381,7 @@ async function reserveMigration(input: MigrationInput, onlineSource?: OnlineWork
     if (!workspace) throw new Error("remote_workspace_migration_workspace_missing");
     if (workspace.sourceIssueId !== selected.sourceIssueId) throw new Error("remote_workspace_migration_source_changed");
     const current = await inspect(tx as unknown as Db, { ...input, onlineSource }, cohort);
-    if (current.authority) return { workspace, authority: current.authority, operation: null, source: current.source, sourceFingerprint: "", issueBinding: current.issueBinding, retainedDirectory: null, archivedGitSource: null, legacyRecoverySources: [] as LegacyWorkspaceRecoverySource[], finalizedRecoveryHolds: [] as FinalizedWorkspaceRecoveryHold[], onlineRecoveryHolds: [] as OnlineRecoveryHold[] };
+    if (current.authority) return { workspace, authority: current.authority, operation: null, source: current.source, sourceFingerprint: "", issueBinding: current.issueBinding, retainedDirectory: null, archivedGitSource: null, legacyRecoverySources: [] as LegacyWorkspaceRecoverySource[], finalizedRecoveryHolds: [] as FinalizedWorkspaceRecoveryHold[], onlineRecoveryHolds: [] as OnlineRecoveryHold[], archivedRepositoryIntents: [] as RepositoryRequest[] };
     if (current.reasons.length) throw new Error(`remote_workspace_migration_blocked:${current.reasons.join(",")}`);
     const nativeSessionContinuity = await inspectNativeWorkspaceMigration(tx as unknown as Db, workspace);
     const source = remoteWorkspaceSourceSchema.parse(input.source ?? current.source);
@@ -389,7 +406,7 @@ async function reserveMigration(input: MigrationInput, onlineSource?: OnlineWork
       if (canonical(recoverySourcesResumeIdentity(operation.metadata?.legacyRecoverySources ?? []))
         !== canonical(recoverySourcesResumeIdentity(current.legacyRecoverySources))) throw new Error("remote_workspace_migration_source_changed");
       if (canonical(operation.metadata?.onlineRecoveryHolds ?? []) !== canonical(current.onlineRecoveryHolds)) throw new Error("remote_workspace_migration_source_changed");
-      return { workspace, authority: null, operation, source, sourceFingerprint, issueBinding, retainedDirectory: current.retainedDirectory, archivedGitSource: current.archivedGitSource, legacyRecoverySources: current.legacyRecoverySources, finalizedRecoveryHolds: current.finalizedRecoveryHolds, onlineRecoveryHolds: current.onlineRecoveryHolds };
+      return { workspace, authority: null, operation, source, sourceFingerprint, issueBinding, retainedDirectory: current.retainedDirectory, archivedGitSource: current.archivedGitSource, legacyRecoverySources: current.legacyRecoverySources, finalizedRecoveryHolds: current.finalizedRecoveryHolds, onlineRecoveryHolds: current.onlineRecoveryHolds, archivedRepositoryIntents: current.archivedRepositoryIntents };
     }
     const [operation] = await tx.insert(workspaceOperations).values({ ...(cohort ? { id: cohort.members.find(member => member.workspaceId === input.workspaceId)!.operationId } : {}), companyId: workspace.companyId, executionWorkspaceId: workspace.id,
       issueId: workspace.sourceIssueId, cwd: workspace.cwd ?? workspace.providerRef, phase: "remote_workspace_migration", status: "running",
@@ -407,39 +424,54 @@ async function reserveMigration(input: MigrationInput, onlineSource?: OnlineWork
     await tx.update(executionWorkspaces).set({ metadata: { ...workspace.metadata, remoteWorkspaceMigration: {
       schema: SCHEMA, operationId: operation!.id, state: "running", sourceFingerprint, source,
     } }, updatedAt: new Date() }).where(eq(executionWorkspaces.id, workspace.id));
-    return { workspace, authority: null, operation: operation!, source, sourceFingerprint, issueBinding: current.issueBinding, retainedDirectory: current.retainedDirectory, archivedGitSource: current.archivedGitSource, legacyRecoverySources: current.legacyRecoverySources, finalizedRecoveryHolds: current.finalizedRecoveryHolds, onlineRecoveryHolds: current.onlineRecoveryHolds };
+    return { workspace, authority: null, operation: operation!, source, sourceFingerprint, issueBinding: current.issueBinding, retainedDirectory: current.retainedDirectory, archivedGitSource: current.archivedGitSource, legacyRecoverySources: current.legacyRecoverySources, finalizedRecoveryHolds: current.finalizedRecoveryHolds, onlineRecoveryHolds: current.onlineRecoveryHolds, archivedRepositoryIntents: current.archivedRepositoryIntents };
   });
 }
 type ReservedMigration = Awaited<ReturnType<typeof reserveMigration>>;
 type MigrationPlan = { input: MigrationInput; onlineSource?: OnlineWorkspaceSource; reserved: ReservedMigration };
 
 async function lockMigrationRecovery(lock: MigrationTransaction, plans: MigrationPlan[], cohort?: WorkspaceMigrationCohort) {
-  const online = plans.filter(plan => plan.onlineSource);
+  const online = plans.filter(plan => !plan.input.writersStopped
+    && (plan.onlineSource || plan.reserved.workspace.status === "archived" && plan.reserved.archivedGitSource));
   if (!online.length) return;
   if (!await lockOnlineLegacyWorkspaceRecoverySources(lock as unknown as Db, { companyId: online[0].input.companyId,
-    sources: online.flatMap(({ reserved, onlineSource }) => [...reserved.legacyRecoverySources, ...onlineSource!.companions.flatMap(proof => proof.sources)]),
-    holds: online.flatMap(({ reserved, onlineSource }) => [...reserved.onlineRecoveryHolds, ...onlineSource!.companions.flatMap(proof => proof.holds)]) }))
+    sources: online.flatMap(({ reserved, onlineSource }) => [...reserved.legacyRecoverySources, ...(onlineSource?.companions.flatMap(proof => proof.sources) ?? [])]),
+    holds: online.flatMap(({ reserved, onlineSource }) => [...reserved.onlineRecoveryHolds, ...(onlineSource?.companions.flatMap(proof => proof.holds) ?? [])]) }))
     throw new Error("remote_workspace_migration_blocked:remote_copyback_owned");
-  const readers = await Promise.allSettled(online.map(async ({ input, onlineSource, reserved }) => {
+  await mapCohortMembers(online, async ({ input, onlineSource, reserved }) => {
     const current = await inspect(input.db, { ...input, onlineSource, operationId: reserved.operation!.id }, cohort);
     if (current.reasons.length || canonical(current.legacyRecoverySources) !== canonical(reserved.legacyRecoverySources)
       || canonical(current.onlineRecoveryHolds) !== canonical(reserved.onlineRecoveryHolds))
       throw new Error("remote_workspace_migration_recovery_source_changed");
-  }));
-  for (const reader of readers) if (reader.status === "rejected") throw reader.reason;
+  }, online[0].input.signal);
 }
 
-function createMigrationChildVerifier(input: MigrationInput, onlineSource: OnlineWorkspaceSource | undefined, sourceLock: MigrationTransaction) {
+function createMigrationChildVerifier(input: MigrationInput, onlineSource: OnlineWorkspaceSource | undefined, sourceLock: MigrationTransaction, cohort = false) {
   if (onlineSource?.kind !== "git") return undefined;
   const verifier = createNestedWorkspaceImportVerifier({ db: input.db, storage: input.storage, companyId: input.companyId,
     sourceLock, projectIds: onlineSource.projectIds, issueIds: onlineSource.issueIds, signal: input.signal, persistVerification: true });
+  type Options = Parameters<typeof prepareNestedWorkspaceImports>[0];
+  const initial = new Map<string, ReturnType<typeof prepareNestedWorkspaceImports>>(), final = new Map<string, ReturnType<typeof prepareNestedWorkspaceImports>>();
   let pending = Promise.resolve();
+  const prepare = (options: Options) => {
+    const work = pending.then(() => verifier.prepare(options));
+    pending = work.then(() => undefined, () => undefined);
+    return work;
+  };
+  const shared = async (options: Options, cache: typeof initial) => {
+    await verifier.assertOwner();
+    const root = options.workspace.cwd ?? options.workspace.providerRef;
+    const key = canonical([root ? await fs.realpath(root) : null, [...(options.gitSourceRoots ?? [])].sort(), options.recordedChildren ?? null]);
+    let work = cache.get(key);
+    if (!work) { work = prepare(options); cache.set(key, work); }
+    const result = await work;
+    await verifier.assertOwner();
+    return result;
+  };
   return {
-    prepare(options: Parameters<typeof prepareNestedWorkspaceImports>[0]) {
-      const work = pending.then(() => verifier.prepare(options));
-      pending = work.then(() => undefined, () => undefined);
-      return work;
-    },
+    prepare: (options: Options) => cohort ? shared(options, initial) : prepare(options),
+    finalize: (options: Options) => shared(options, final),
+    deferFinal: cohort,
     async close() { await pending; await verifier.close(); },
   };
 }
@@ -489,6 +521,7 @@ async function captureMigration(input: MigrationInput, reserved: ReservedMigrati
       if (!saved) throw new Error("remote_workspace_migration_operation_changed");
       operation = saved;
     }
+    if (sourceRoot) await assertArchivedRepositoryIntents(sourceRoot, reserved.archivedRepositoryIntents);
     const exclude = nested.map(child => child.relativePath);
     const captured = recovered ?? await captureRemoteWorkspaceDirectory({ cwd: sourceRoot!, archivePath, exclude, requireNoGit: onlineSource?.kind === "ordinary", gitSourceRoots: onlineSource?.gitSourceRoots, signal: input.signal });
     const restoredArchive = path.join(scratch, "verified.pcws"), restored = path.join(scratch, "restored");
@@ -504,19 +537,20 @@ async function captureMigration(input: MigrationInput, reserved: ReservedMigrati
     if (!verifiedArchivePath) await loadWorkspaceSnapshotArchive({ storage: input.storage, reference: ref,
       targetPath: restoredArchive, signal: input.signal });
     await restoreRemoteWorkspaceArchive({ archivePath: restoredArchive, targetDir: restored, expectedManifestDigest: ref.manifestDigest, signal: input.signal });
+    await assertArchivedRepositoryIntents(restored, reserved.archivedRepositoryIntents);
     if (!recovered) {
       const currentArchive = path.join(scratch, "current.pcws");
       const current = await captureRemoteWorkspaceDirectory({ cwd: sourceRoot!, archivePath: currentArchive, exclude, requireNoGit: onlineSource?.kind === "ordinary", gitSourceRoots: onlineSource?.gitSourceRoots, signal: input.signal });
       if (current.manifestDigest !== captured.manifestDigest) throw new Error("remote_workspace_migration_source_changed");
     }
-    if (nested.length) {
+    if (nested.length && !childVerifier?.deferFinal) {
       const verifyScratch = path.join(scratch, "verify-nested"); await fs.mkdir(verifyScratch);
       const verified = await (childVerifier?.prepare ?? prepareNestedWorkspaceImports)({ ...input, workspace: reserved.workspace,
         scratch: verifyScratch, recordedChildren: nested, gitSourceRoots: onlineSource?.gitSourceRoots });
       if (canonical(verified) !== canonical(nested)) throw new Error("nested_workspace_source_changed");
     }
     input.signal?.throwIfAborted();
-    return { operation, ref, nested, scratch };
+    return { operation, ref, nested, scratch, restored };
   } catch (error) { await removeTaskDirectoryTree(scratch); throw error; }
 }
 type CapturedMigration = Awaited<ReturnType<typeof captureMigration>>;
@@ -531,9 +565,9 @@ async function validateMigrationPublication(tx: MigrationTransaction, input: Mig
       || journal.issueId !== operation.issueId || journal.cwd !== operation.cwd
       || canonical(journal.metadata) !== canonical(operation.metadata)) throw new Error("workspace_cohort_journal_changed");
   }
-  await lockMigrationParents(tx, input.companyId, reserved.workspace.sourceIssueId, onlineSource ? [
+  await lockMigrationParents(tx, input.companyId, reserved.workspace.sourceIssueId, onlineSource || reserved.archivedGitSource ? [
     ...reserved.legacyRecoverySources.map(source => source.issueId),
-    ...onlineSource.companions.flatMap(proof => proof.sources.map(source => source.issueId)),
+    ...(onlineSource?.companions.flatMap(proof => proof.sources.map(source => source.issueId)) ?? []),
   ] : []);
   for (const actionId of [...new Set([...reserved.finalizedRecoveryHolds, ...reserved.onlineRecoveryHolds].map(held => held.actionId))].sort()) {
     await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
@@ -558,12 +592,16 @@ async function validateMigrationPublication(tx: MigrationTransaction, input: Mig
       .from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
         eq(environmentLeases.id, allocation.leaseId))).for("update", { noWait: true });
   }
+  if (reserved.archivedGitSource?.recipe) await tx.select({ id: executionWorkspaceRepositories.id }).from(executionWorkspaceRepositories)
+    .where(and(eq(executionWorkspaceRepositories.companyId, input.companyId), eq(executionWorkspaceRepositories.executionWorkspaceId, input.workspaceId)))
+    .orderBy(executionWorkspaceRepositories.id).for("update", { noWait: true });
   const validation = await inspect(tx as unknown as Db, { ...input, operationId: operation.id, onlineSource }, cohort);
   if (!input.source && canonical(validation.source) !== canonical(reserved.source)) throw new Error("remote_workspace_migration_source_changed");
   if (validation.issueBinding !== reserved.issueBinding) throw new Error("remote_workspace_migration_source_changed");
   if (Boolean(validation.retainedDirectory) !== Boolean(reserved.retainedDirectory)) throw new Error("remote_workspace_migration_source_changed");
   if (canonical(gitSourceProof(validation.archivedGitSource)) !== canonical(gitSourceProof(reserved.archivedGitSource))) throw new Error("remote_workspace_migration_source_changed");
   if (validation.reasons.length) throw new Error(`remote_workspace_migration_blocked:${validation.reasons.join(",")}`);
+  await assertArchivedRepositoryIntents(captured.restored, validation.archivedRepositoryIntents);
   if (reserved.archivedGitSource) await lockArchivedGitMigrationSources(tx as unknown as Db, workspace, reserved.archivedGitSource);
   const [uploaded] = await tx.select().from(executionWorkspaceSnapshots).where(and(eq(executionWorkspaceSnapshots.companyId, workspace.companyId),
     eq(executionWorkspaceSnapshots.executionWorkspaceId, workspace.id), eq(executionWorkspaceSnapshots.id, ref.id))).for("update");
@@ -683,15 +721,29 @@ export async function migrateRemoteWorkspace(input: MigrationInput) {
 const cohortSchema = z.object({
   schema: z.literal("paperclip.remote-workspace-cohort.v1"), id: z.string().uuid(), companyId: z.string().uuid(),
   sourceProof: z.string().regex(/^[a-f0-9]{64}$/),
-  members: z.array(z.object({ workspaceId: z.string().uuid(), operationId: z.string().uuid() }).strict()).min(1).max(8),
+  members: z.array(z.object({ workspaceId: z.string().uuid(), operationId: z.string().uuid() }).strict()).min(1).max(32),
 }).strict();
+
+async function mapCohortMembers<T, R>(members: readonly T[], read: (member: T, index: number) => Promise<R>, signal?: AbortSignal): Promise<R[]> {
+  const results: R[] = [], cancellation = members.length > 8 ? signal : undefined;
+  for (let start = 0; start < members.length; start += 8) {
+    cancellation?.throwIfAborted();
+    const readers = await Promise.allSettled(members.slice(start, start + 8).map((member, index) => read(member, start + index)));
+    for (const reader of readers) {
+      if (reader.status === "rejected") throw reader.reason;
+      results.push(reader.value);
+    }
+    cancellation?.throwIfAborted();
+  }
+  return results;
+}
 
 export async function migrateRemoteWorkspaceCohort(input: {
   db: Db; storage: StorageService; companyId: string; workspaceIds: readonly string[];
   apply?: boolean; concurrency?: number; signal: AbortSignal; sourceLockWaitMs?: number;
 }) {
   const companyId = z.string().uuid().parse(input.companyId).toLowerCase();
-  const workspaceIds = z.array(z.string().uuid()).min(1).max(8).parse(input.workspaceIds).map(id => id.toLowerCase()).sort();
+  const workspaceIds = z.array(z.string().uuid()).min(1).max(32).parse(input.workspaceIds).map(id => id.toLowerCase()).sort();
   const concurrency = z.number().int().min(1).max(8).parse(input.concurrency ?? 2);
   if (new Set(workspaceIds).size !== workspaceIds.length) throw new Error("workspace_cohort_duplicate_member");
   input.signal.throwIfAborted();
@@ -720,20 +772,22 @@ export async function migrateRemoteWorkspaceCohort(input: {
         || cohort.members.find(member => member.workspaceId === snapshot.executionWorkspaceId)?.operationId !== operation.id
         || canonical(operation.metadata?.cohortMigration) !== canonical(cohort))) throw new Error("workspace_cohort_membership_changed");
     return { companyId, cohortId: cohort.id, applied: Boolean(input.apply), replayed: true,
-      members: await Promise.all(workspaceIds.map(workspaceId => inventoryRemoteWorkspaceMigration(input.db, { companyId, workspaceId }))) };
+      members: await mapCohortMembers(workspaceIds, workspaceId => inventoryRemoteWorkspaceMigration(input.db, { companyId, workspaceId }), input.signal) };
   }
   if (imported.some(Boolean)) throw new Error("workspace_cohort_membership_changed");
   const stop = new AbortController(), signal = AbortSignal.any([input.signal, stop.signal]);
-  const members = await Promise.all(workspaceIds.map(async workspaceId => {
+  const members = await mapCohortMembers(workspaceIds, async workspaceId => {
     const memberInput: MigrationInput = { db: input.db, storage: input.storage, companyId, workspaceId, apply: true, signal };
     const onlineSource = await resolveMigrationSource(memberInput);
     if (!onlineSource) throw new Error("workspace_cohort_online_source_required");
     return { input: memberInput, onlineSource };
-  }));
+  }, signal);
   const scopeIdentity = (scope: OnlineWorkspaceSource) => canonical({ kind: scope.kind,
     projectIds: scope.projectIds, issueIds: scope.issueIds, workspaceIds: scope.workspaceIds });
   if (members.some(member => scopeIdentity(member.onlineSource) !== scopeIdentity(members[0].onlineSource)))
     throw new Error("workspace_cohort_source_scope_mismatch");
+  if (members.length > 8 && members.some(member => member.onlineSource.root !== members[0].onlineSource.root))
+    throw new Error("workspace_cohort_same_root_required");
   for (const member of members) for (const other of members) {
     if (member !== other && member.onlineSource.root !== other.onlineSource.root
       && member.onlineSource.root.startsWith(other.onlineSource.root + path.sep)) throw new Error("workspace_cohort_leaf_members_required");
@@ -741,6 +795,7 @@ export async function migrateRemoteWorkspaceCohort(input: {
   const sourceProof = createHash("sha256").update(canonical({ scope: scopeIdentity(members[0].onlineSource),
     members: initial.map(workspace => ({ workspaceId: workspace.id, fingerprint: fingerprint(workspace) })) })).digest("hex");
   const pending = [];
+  let unchangedMembers = true;
   for (const workspace of initial) {
     const marker = object(workspace.metadata?.remoteWorkspaceMigration);
     if (marker.schema !== SCHEMA || typeof marker.operationId !== "string") continue;
@@ -749,22 +804,24 @@ export async function migrateRemoteWorkspaceCohort(input: {
       eq(workspaceOperations.id, marker.operationId), eq(workspaceOperations.phase, "remote_workspace_migration")));
     if (!operation?.metadata?.cohortMigration) throw new Error("workspace_cohort_foreign_journal");
     if (operation.status !== "running" || operation.finishedAt !== null) throw new Error("workspace_cohort_journal_changed");
+    unchangedMembers &&= marker.sourceFingerprint === fingerprint(workspace)
+      && operation.metadata.sourceFingerprint === marker.sourceFingerprint;
     pending.push(cohortSchema.parse(operation.metadata.cohortMigration));
   }
-  const cohort: WorkspaceMigrationCohort = pending[0] ?? { schema: "paperclip.remote-workspace-cohort.v1", id: randomUUID(), companyId,
+  let cohort: WorkspaceMigrationCohort = pending[0] ?? { schema: "paperclip.remote-workspace-cohort.v1", id: randomUUID(), companyId,
     sourceProof, members: workspaceIds.map(workspaceId => ({ workspaceId, operationId: randomUUID() })) };
-  if (cohort.companyId !== companyId || cohort.sourceProof !== sourceProof
+  const refreshSourceProof = cohort.sourceProof !== sourceProof;
+  if (cohort.companyId !== companyId || refreshSourceProof && (pending.length !== workspaceIds.length || !unchangedMembers)
     || canonical(cohort.members.map(member => member.workspaceId)) !== canonical(workspaceIds)
     || new Set(cohort.members.map(member => member.operationId)).size !== workspaceIds.length
     || pending.some(marker => canonical(marker) !== canonical(cohort))) throw new Error("workspace_cohort_membership_changed");
   const preflight = async (db: ReadDb) => {
-    const readers = await Promise.allSettled(members.map(async member => {
+    await mapCohortMembers(members, async member => {
       const current = await inspect(db, { ...member.input, onlineSource: member.onlineSource }, cohort);
       if (current.reasons.length) throw new Error(`remote_workspace_migration_blocked:${current.reasons.join(",")}`);
       if (fingerprint(current.workspace) !== fingerprint(initial.find(workspace => workspace.id === member.input.workspaceId)!))
         throw new Error("workspace_cohort_source_changed");
-    }));
-    for (const reader of readers) if (reader.status === "rejected") throw reader.reason;
+    }, signal);
   };
   if (!input.apply) { await preflight(input.db); return { companyId, cohortId: cohort.id, applied: false, eligible: true, workspaceIds }; }
   const publications: Parameters<typeof publishActivity>[0][] = [];
@@ -774,19 +831,51 @@ export async function migrateRemoteWorkspaceCohort(input: {
       if (!await tryAcquireExecutionWorkspaceLifecycleLock(lock, workspaceId)) throw new IsolatedRepositorySourceBusy("workspace_source_busy");
     }
     await preflight(input.db);
-    const reservations = await Promise.allSettled(members.map(async member => {
+    const plans: MigrationPlan[] = await mapCohortMembers(members, async member => {
       const reserved = await reserveMigration(member.input, member.onlineSource, cohort,
         fingerprint(initial.find(workspace => workspace.id === member.input.workspaceId)!));
       if (reserved.authority) throw new Error("workspace_cohort_membership_changed");
       return { ...member, reserved };
-    }));
-    const plans: MigrationPlan[] = reservations.map(reservation => {
-      if (reservation.status === "rejected") throw reservation.reason;
-      return reservation.value;
-    });
+    }, signal);
     await lockMigrationRecovery(lock, plans, cohort);
+    if (refreshSourceProof) {
+      const refreshedCohort = { ...cohort, sourceProof };
+      const operations = await input.db.transaction(async tx => {
+        await lockMigrationParents(tx, companyId, null, plans.flatMap(plan => [plan.reserved.workspace.sourceIssueId!,
+          ...plan.reserved.legacyRecoverySources.map(source => source.issueId),
+          ...plan.onlineSource!.companions.flatMap(proof => proof.sources.map(source => source.issueId))]));
+        const locked = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.companyId, companyId),
+          inArray(executionWorkspaces.id, workspaceIds))).orderBy(executionWorkspaces.id).for("update");
+        if (locked.length !== plans.length || plans.some(plan => {
+          const workspace = locked.find(row => row.id === plan.input.workspaceId)!;
+          return fingerprint(workspace) !== plan.reserved.sourceFingerprint
+            || canonical(workspace.metadata?.remoteWorkspaceMigration) !== canonical(plan.reserved.workspace.metadata?.remoteWorkspaceMigration);
+        })) throw new Error("workspace_cohort_source_changed");
+        await preflight(tx);
+        const updated = [];
+        for (const plan of plans) {
+          signal.throwIfAborted();
+          const operation = plan.reserved.operation!;
+          const [current] = await tx.update(workspaceOperations).set({ metadata: { ...operation.metadata,
+            cohortMigration: refreshedCohort }, updatedAt: new Date() }).where(and(
+            eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.executionWorkspaceId, plan.input.workspaceId),
+            eq(workspaceOperations.id, operation.id), eq(workspaceOperations.phase, "remote_workspace_migration"),
+            eq(workspaceOperations.status, "running"), sql`${workspaceOperations.finishedAt} is null`,
+            sql`${workspaceOperations.issueId} is not distinct from ${operation.issueId}::uuid`,
+            sql`${workspaceOperations.cwd} is not distinct from ${operation.cwd}`,
+            eq(workspaceOperations.metadata, operation.metadata!))).returning();
+          if (!current) throw new Error("workspace_cohort_journal_changed");
+          updated.push(current);
+        }
+        await lock.execute(sql`select 1`);
+        signal.throwIfAborted();
+        return updated;
+      });
+      for (const [index, plan] of plans.entries()) plan.reserved.operation = operations[index];
+      cohort = refreshedCohort;
+    }
     const captures: Array<CapturedMigration | undefined> = Array(plans.length);
-    const childVerifier = createMigrationChildVerifier(plans[0].input, plans[0].onlineSource, lock);
+    const childVerifier = createMigrationChildVerifier(plans[0].input, plans[0].onlineSource, lock, true);
     let next = 0, failure: unknown;
     const worker = async () => {
       while (!signal.aborted && next < plans.length) {
@@ -800,6 +889,14 @@ export async function migrateRemoteWorkspaceCohort(input: {
       for (const peer of peers) if (peer.status === "rejected") failure ??= peer.reason;
       if (failure) throw failure;
       signal.throwIfAborted();
+      await mapCohortMembers(plans, async (plan, index) => {
+        const captured = captures[index]!;
+        if (!captured.nested.length) return;
+        const scratch = path.join(captured.scratch, "verify-nested"); await fs.mkdir(scratch);
+        const verified = await (childVerifier?.finalize ?? prepareNestedWorkspaceImports)({ ...plan.input, workspace: plan.reserved.workspace,
+          scratch, recordedChildren: captured.nested, gitSourceRoots: plan.onlineSource?.gitSourceRoots });
+        if (canonical(verified) !== canonical(captured.nested)) throw new Error("nested_workspace_source_changed");
+      }, signal);
       await lock.execute(sql`select 1`);
       await lock.transaction(async tx => {
         await lockMigrationParents(tx, companyId, null, plans.flatMap(plan => [
@@ -825,9 +922,9 @@ export async function migrateRemoteWorkspaceCohort(input: {
     } catch (error) { failure = error; throw error; }
     finally {
       await childVerifier?.close();
-      const cleanup = await Promise.allSettled(captures.filter((capture): capture is CapturedMigration => Boolean(capture))
-        .map(capture => removeTaskDirectoryTree(capture.scratch)));
-      const errors = cleanup.flatMap(outcome => outcome.status === "rejected" ? [outcome.reason] : []);
+      const cleanup = await mapCohortMembers(captures.filter((capture): capture is CapturedMigration => Boolean(capture)),
+        capture => removeTaskDirectoryTree(capture.scratch).then(() => [], error => [error]));
+      const errors = cleanup.flat();
       if (errors.length) throw new AggregateError(failure ? [failure, ...errors] : errors, "workspace_cohort_cleanup_failed");
       if (!failure) signal.throwIfAborted();
     }
