@@ -17,7 +17,9 @@ import { BoardUi } from "./board-ui.js";
 import { DEFAULT_MINIO_BINARY, MINIO_RELEASE, minioBinary, objectStoreServerEnvironment, startMinio, type ObjectStore } from "./object-store.js";
 import { StorageChaos, planStorageFaults, replayStorageWindows, type StorageFaultReceipt } from "./storage-chaos.js";
 import { startStorageFaultProxy } from "./storage-proxy.js";
+import { needsCredentialRotation, startCredentialRotation, type CredentialRotation } from "./storage-credentials.js";
 import { describeProviderFault, installProviderFaultSeam, resolveRealCodex, withProviderFaultCheck, type ProviderFaultSeam } from "./provider-faults.js";
+import { installAcpxSidecarSeam, withAcpxSidecarHook, type AcpxSidecarSeam } from "./acpx-provider-faults.js";
 import { CREDENTIAL_FOR_ADAPTER, parseCommand, replayCommand, waveIdFor } from "./config.js";
 import { assertControllerMatchesImage, defaultDaytonaImageCacheRoot, prepareDaytonaImageArtifacts } from "./daytona-image.js";
 import { PLUGIN_BUILD_STAMP, pluginBuildState } from "./plugin-build.js";
@@ -36,6 +38,8 @@ import { matrixMayLaunch, planMatrixWave } from "./journey-matrix.js";
 import { StormRun, TASK_FAULT_LOG, observedFaultSchedule, planWave, replayOnCurrentBuild, replayRecordFor, replayWave, type TaskFaultLog } from "./scheduler.js";
 import { chaosLifecycleOverrides, seedChaosLab } from "./seed.js";
 import { ChaosSupervisor } from "./supervisor.js";
+import { TimeShiftedApi } from "./time-faults.js";
+import type { RestartStep } from "./repeated-restarts.js";
 import { isBrokenStdoutError, markTimelineEchoBroken, Timeline } from "./timeline.js";
 import { guardedRunnerOutputs, worktreeFingerprint } from "./wave-guard.js";
 import type { FaultKind, FaultReceipt, OracleArtifacts, TriggerId, WavePlan } from "./types.js";
@@ -247,7 +251,9 @@ async function main(): Promise<number> {
   let objectStore: ObjectStore | null = null;
   let storageChaos: StorageChaos | null = null;
   let storageProxy: Awaited<ReturnType<typeof startStorageFaultProxy>> | null = null;
+  let credentialRotation: CredentialRotation | null = null;
   let providerFaults: ProviderFaultSeam | null = null;
+  let acpxSidecarSeam: AcpxSidecarSeam | null = null;
   let speedSection: string | null = null;
   let harnessError: unknown;
   process.on("uncaughtException", error => {
@@ -280,21 +286,38 @@ async function main(): Promise<number> {
       objectStore = await startMinio({ binary, root: supervisor.paths.temporaryRoot });
       storageProxy = await startStorageFaultProxy(objectStore.endpoint);
       Object.assign(serverEnvironment, objectStoreServerEnvironment(objectStore, storageProxy.endpoint, `chaos/${plan.waveId}/`));
+      if (needsCredentialRotation(plan.options)) {
+        const rotating = await startCredentialRotation({ store: objectStore, binary, root: supervisor.paths.temporaryRoot, record: (kind, data) => timeline.add(kind, data) });
+        credentialRotation = rotating.rotation;
+        Object.assign(serverEnvironment, rotating.environment);
+      }
       timeline.add("object_store_started", { release: MINIO_RELEASE, endpoint: objectStore.endpoint, proxy: storageProxy.endpoint, bucket: objectStore.bucket });
     }
     if (plan.tasks.some(task => task.providerFault)) {
       // PV1–PV3: route the server's Codex launches through the fault shim (no product change).
-      const realCodex = resolveRealCodex(repositoryRoot);
+      // The provider the server actually runs: `--server-from` serves another checkout.
+      const realCodex = resolveRealCodex(plan.options.serverFrom ?? repositoryRoot);
       providerFaults = await installProviderFaultSeam({ root: supervisor.paths.temporaryRoot, logPath: path.join(waveDir, "provider-faults.jsonl"),
         realCommand: realCodex.command, realVersion: realCodex.version, realManifestPath: realCodex.manifestPath,
         ...(process.env.NODE_OPTIONS ? { inheritedNodeOptions: process.env.NODE_OPTIONS } : {}) });
       await providerFaults.arm(plan.tasks);
       Object.assign(serverEnvironment, providerFaults.serverEnvironment);
+      if (plan.tasks.some(task => task.providerFault && task.adapter === "claude")) {
+        // Claude (ACPX): the stand-in sidecar taps the verified provider's pipe (acpx-provider-faults.ts).
+        // The seam must mirror the runner the server actually loads (`--server-from` runs another checkout).
+        acpxSidecarSeam = await installAcpxSidecarSeam({ repositoryRoot: plan.options.serverFrom ?? repositoryRoot, waveId: plan.waveId, controlPath: providerFaults.controlPath,
+          logPath: providerFaults.logPath, stateDirectory: providerFaults.stateDirectory });
+        Object.assign(serverEnvironment, acpxSidecarSeam.serverEnvironment,
+          { NODE_OPTIONS: withAcpxSidecarHook(serverEnvironment.NODE_OPTIONS) });
+        timeline.add("acpx_provider_faults_installed", { standInRoot: acpxSidecarSeam.standInRoot, realSidecar: acpxSidecarSeam.realSidecar });
+      }
       timeline.add("provider_faults_installed", { realCodex: realCodex.command, codexVersion: realCodex.version,
         rules: plan.tasks.flatMap(task => task.providerFault ? [`${task.taskId}:${describeProviderFault(task.providerFault)}`] : []) });
     }
+    if (plan.options.timeAgeMs) supervisor.timeAgeMs = plan.options.timeAgeMs;
     await supervisor.start(serverEnvironment);
-    const api = new ChaosApi(supervisor.baseUrl);
+    // TM2/TM3 age the database; the observer and grader read run times back at their real times.
+    const api: ChaosApi = new TimeShiftedApi(supervisor.baseUrl, supervisor.agingShifts);
     const lab = await seedChaosLab({ api, env: plan.options.env, waitForReadyAgents: true, cancelled: () => interrupted, daytonaImage: plan.options.daytonaImage, daytonaCpu: plan.options.daytonaCpu,
       daytonaReuseLease: plan.options.daytonaReuseLease,
       adapters: [...new Set([...plan.tasks.map(task => task.adapter),
@@ -326,16 +349,16 @@ async function main(): Promise<number> {
     if (storageProxy && (plan.options.storageWindows?.length || plan.options.storageFaults?.length)) {
       const windows = plan.options.storageWindows ?? planStorageFaults({ kinds: plan.options.storageFaults!, seed: plan.seed,
         spanMs: plan.storm?.durationMs ?? plan.tasks.length * 4 * 60_000, ...(plan.options.storageFaultMs ? { durationMs: plan.options.storageFaultMs } : {}) });
-      storageChaos = new StorageChaos(windows, Date.now(), storageProxy, (kind, data) => timeline.add(kind, data));
+      storageChaos = new StorageChaos(windows, Date.now(), credentialRotation?.wrap(storageProxy) ?? storageProxy, (kind, data) => timeline.add(kind, data));
       if (!plan.options.storageWindows) storageChaos.start();
       timeline.add("storage_faults_planned", { windows: windows.map(window => `${window.kind}@${window.startMs}ms+${window.durationMs}ms`) });
     }
     if (storm) timeline.add("storm_started", { durationMs: storm.plan.durationMs, plannedFaults: storm.plan.faults.length });
     // Faults are serialized; each one hits every task in flight when it starts.
     const fireFault = (kind: FaultKind, holdMs: number, requestedBy: string, exposed: readonly TaskObserver[],
-      trigger?: { trigger: TriggerId; delayMs: number }, onSettled?: () => void) => {
+      trigger?: { trigger: TriggerId; delayMs: number }, onSettled?: () => void, restartSteps?: RestartStep[]) => {
       faultsQueued += 1;
-      faultWork.push(supervisor.fault(kind, holdMs, requestedBy, trigger).finally(() => { faultsQueued -= 1; onSettled?.(); }).then(receipt => {
+      faultWork.push(supervisor.fault(kind, holdMs, requestedBy, trigger, restartSteps).finally(() => { faultsQueued -= 1; onSettled?.(); }).then(receipt => {
         faults.push(receipt);
         checkWorktree(receipt.faultId);
         for (const candidate of exposed) {
@@ -442,6 +465,16 @@ async function main(): Promise<number> {
         if (plan.options.storageWindows && storageChaos && launched.length === 1) storageChaos.start();
         if (!next.done) active.push(next);
       }
+      // `--provider-fault-restart`: a task's K1 is armed once the shim logged its fault.
+      if (providerFaults) {
+        for (const observer of active) {
+          if (!observer.plan.providerFault?.restart || observer.record.providerFaultAppliedAt !== undefined) continue;
+          const rule = observer.plan.providerFault;
+          const applied = (await providerFaults.eventsFor(observer.plan.nonce))
+            .find(event => event.event === "applied" && event.kind === rule.kind && event.message === rule.message);
+          if (applied) observer.record.providerFaultAppliedAt = applied.at;
+        }
+      }
       await Promise.all(active.filter(observer => now - (lastPoll.get(observer) ?? 0) >= plan.options.pollMs).map(async observer => {
         lastPoll.set(observer, now);
         await observer.poll(now);
@@ -466,7 +499,7 @@ async function main(): Promise<number> {
         const trigger = due.trigger && due.trigger !== "time" ? { trigger: due.trigger, delayMs: due.delayMs ?? 0 } : undefined;
         if (trigger) timeline.add("trigger_fired", { taskId: observer.plan.taskId, fault: due.kind, ...trigger });
         // Inside a storm a triggered fault is a restart too: the next storm gap runs from its settle.
-        fireFault(due.kind, due.holdMs, observer.plan.taskId, exposed, trigger, storm ? () => storm.settled(Date.now()) : undefined);
+        fireFault(due.kind, due.holdMs, observer.plan.taskId, exposed, trigger, storm ? () => storm.settled(Date.now()) : undefined, due.restartSteps);
       }
       if (storm && !faultsQueued && !supervisor.faultInProgress && supervisor.serverReady) {
         const due = storm.due(Date.now());
@@ -540,7 +573,8 @@ async function main(): Promise<number> {
       const graded = artifacts ? observer.definition.grade(observer.plan.nonce, artifacts, observer.workloadAgents())
         : { verdict: "fail" as const, checks: [{ name: "artifacts_collected", ok: false, detail: observer.record.launchError ?? "collection failed" }] };
       // A provider-fault task whose fault never happened tested nothing.
-      const oracle = withProviderFaultCheck(graded, observer.plan, artifacts?.providerFaultEvents ?? []);
+      const restart = faults.find(receipt => receipt.requestedBy === observer.plan.taskId && receipt.trigger === "provider");
+      const oracle = withProviderFaultCheck(graded, observer.plan, artifacts?.providerFaultEvents ?? [], restart?.startedAt ?? null);
       const grade = gradeTask(observer.record, faults, observer.definition.budgetMs, oracle, universalByIssue ? {
         runMessages: allRunMessages, recoveryActions: universalByIssue.get(observer.record.issueId ?? "")?.recoveryActions ?? [] } : undefined);
       let evidence: string | null = null;
@@ -647,12 +681,15 @@ async function main(): Promise<number> {
       }
     }
     storageChaos?.stop();
+    await credentialRotation?.settled();
+    if (credentialRotation?.failures.length) harnessError ??= new Error(`ST5R credential rotation failed: ${credentialRotation.failures.join("; ")}`);
     if (storageProxy) {
       if (storageChaos) await writeFile(path.join(waveDir, "storage-faults.json"), `${JSON.stringify(storageChaos.receipts, null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
       await writeFile(path.join(waveDir, "storage-proxy.json"), `${JSON.stringify(storageProxy.counts(), null, 2)}\n`, { mode: 0o600 }).catch(() => undefined);
       await storageProxy.close().catch(() => undefined);
     }
     await objectStore?.stop().catch(error => timeline.add("object_store_stop_failed", { error: String(error) }));
+    await acpxSidecarSeam?.remove().catch(error => timeline.add("acpx_stand_in_cleanup_failed", { error: String(error) }));
     const retention = await releaseInstance(supervisor.paths.temporaryRoot, { keep, stopFailed, remoteCleanupPending, owner: plan.waveId })
       .catch(error => { timeline.add("instance_cleanup_failed", { error: String(error) }); return null; });
     if (retention?.kept) timeline.add("instance_kept", { temporaryRoot: supervisor.paths.temporaryRoot, reason: retention.reason });
