@@ -748,6 +748,38 @@ describe.skipIf(!support.supported)("remote workspace migration", () => {
     expect(uploaded).toBe(true); expect(readRemoteWorkspaceAuthority((await workspace(f.workspaceId)).metadata)).toBeNull();
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toEqual(f.task);
   });
+  it("retains archived intent payload through the final saved relativePath proof", async () => {
+    const f = await archivedRepositoryFixture(), put = storage.putFile.bind(storage);
+    let changed = false, restored = "", finalProof = 0;
+    storage.putFile = async input => {
+      const result = await put(input);
+      if (!changed) { changed = true; await db.update(executionWorkspaceRepositories).set({ relativePath: "untracked.txt" })
+        .where(eq(executionWorkspaceRepositories.id, f.repository.id)); }
+      return result;
+    };
+    const restore = workspaceArchive.restoreRemoteWorkspaceArchive, lstat = fs.lstat.bind(fs);
+    const restoreSpy = vi.spyOn(workspaceArchive, "restoreRemoteWorkspaceArchive").mockImplementation(async input => {
+      const result = await restore(input); restored = input.targetDir; return result;
+    });
+    const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+      if (restored && String(args[0]) === path.join(restored, "untracked.txt")) {
+        finalProof++;
+        for (const name of ["workspace.pcws", "verified.pcws", "current.pcws"])
+          expect((await lstat(path.join(path.dirname(restored), name))).isFile()).toBe(true);
+        expect((await lstat(restored)).isDirectory()).toBe(true);
+      }
+      return lstat(...args);
+    });
+    try {
+      await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).rejects.toThrow("repository_preparation_unresolved");
+      expect(changed).toBe(true); expect(finalProof).toBeGreaterThan(0);
+      expect(readRemoteWorkspaceAuthority((await workspace(f.workspaceId)).metadata)).toBeNull();
+      expect((await db.select().from(executionWorkspaceRepositories).where(eq(executionWorkspaceRepositories.id, f.repository.id)))[0])
+        .toEqual({ ...f.repository, relativePath: "untracked.txt" });
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toEqual(f.task);
+      await expect(fs.lstat(path.dirname(restored))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { lstatSpy.mockRestore(); restoreSpy.mockRestore(); }
+  });
   it("rechecks the current archived repository intent path at publication", async () => {
     const f = await archivedRepositoryFixture(), put = storage.putFile.bind(storage); let uploaded = false;
     storage.putFile = async input => { const saved = await put(input); uploaded = true;
@@ -1670,6 +1702,57 @@ describe.skipIf(!support.supported)("remote workspace migration", () => {
     expect(await db.select().from(executionWorkspaceSnapshots)).toHaveLength(0);
     expect(readRemoteWorkspaceAuthority((await workspace(f.workspaceId)).metadata)).toBeNull();
     if (!foreign) await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).resolves.toMatchObject({ applied: true });
+  });
+  async function importedLinkedFixture() {
+    const { f, nested } = await nestedGitWrapperFixture(), issueId = randomUUID(), workspaceId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Imported linked workspace" });
+    const cwd = path.join(resolvePaperclipInstanceRoot(), "isolated-workspaces", f.companyId, issueId);
+    await git(nested, "worktree", "add", "-b", "imported-linked", cwd);
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: f.companyId, sourceIssueId: issueId,
+      name: "Imported linked workspace", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree", cwd, providerRef: cwd });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+    await migrateRemoteWorkspace({ db, storage, companyId: f.companyId, workspaceId, apply: true });
+    const [operation] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.executionWorkspaceId, workspaceId));
+    const imported = await workspace(workspaceId), authority = readRemoteWorkspaceAuthority(imported.metadata)!;
+    return { f, nested, issueId, workspaceId, cwd, operation: operation!, imported, authority };
+  }
+  it.each(["committed", "superseded"] as const)("recognizes a canonically imported linked Git source (%s)", async status => {
+    const { f, nested, issueId, workspaceId, cwd, operation, imported, authority } = await importedLinkedFixture();
+    if (status === "superseded") await db.update(executionWorkspaceSnapshots).set({ status }).where(eq(executionWorkspaceSnapshots.id, authority.snapshotId!));
+    const scope = await inspectOnlineWorkspaceSource(db, await workspace(f.workspaceId));
+    expect(scope).toMatchObject({ kind: "git", workspaceIds: [f.workspaceId],
+      importedChildren: [expect.objectContaining({ workspaceId, operationId: operation.id, sourcePath: cwd })] });
+    expect(scope!.physicalRoots).toContain(cwd); expect(scope!.issueIds).toContain(issueId);
+    let acquire!: () => void, release!: () => void;
+    const acquired = new Promise<void>(resolve => { acquire = resolve; }), released = new Promise<void>(resolve => { release = resolve; });
+    const holder = withWorkspaceSourceLocks(db, { companyId: f.companyId, issueIds: [issueId] }, async () => { acquire(); await released; });
+    await acquired;
+    try { await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).rejects.toThrow("workspace_source_busy"); }
+    finally { release(); await holder; }
+    await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).resolves.toMatchObject({ applied: true });
+    expect(await workspace(workspaceId)).toEqual(imported);
+    expect(await fs.readFile(path.join(cwd, "tracked.txt"), "utf8")).toBe("committed\n");
+    expect(await fs.readFile(path.join(nested, "tracked.txt"), "utf8")).toBe("unstaged\n");
+  });
+  it.each(["journal", "snapshot", "manifest", "unfinished"] as const)("refuses an imported linked Git source with changed %s provenance", async change => {
+    const { f, operation, authority } = await importedLinkedFixture();
+    if (change === "journal") await db.update(workspaceOperations).set({ status: "failed" }).where(eq(workspaceOperations.id, operation.id));
+    if (change === "snapshot") await db.update(executionWorkspaceSnapshots).set({ status: "uploaded" }).where(eq(executionWorkspaceSnapshots.id, authority.snapshotId!));
+    if (change === "manifest") await db.update(workspaceOperations).set({ metadata: { ...operation.metadata, manifestDigest: "a".repeat(64) } }).where(eq(workspaceOperations.id, operation.id));
+    if (change === "unfinished") await db.update(workspaceOperations).set({ finishedAt: null }).where(eq(workspaceOperations.id, operation.id));
+    expect(await inspectOnlineWorkspaceSource(db, await workspace(f.workspaceId))).toBeNull();
+    await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).rejects.toThrow("online_workspace_source_scope_unproven");
+    expect(readRemoteWorkspaceAuthority((await workspace(f.workspaceId)).metadata)).toBeNull();
+  });
+  it("keeps a foreign local writer blocked after a linked Git source is imported", async () => {
+    const { f, cwd } = await importedLinkedFixture(), companyId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Foreign owner", issuePrefix: "FOREIGN" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Foreign source alias" });
+    await db.insert(executionWorkspaces).values({ companyId, sourceIssueId: issueId, name: "Foreign source alias", mode: "isolated_workspace",
+      strategyType: "git_worktree", providerType: "git_worktree", cwd, providerRef: cwd });
+    expect(await inspectOnlineWorkspaceSource(db, await workspace(f.workspaceId))).toBeNull();
+    await expect(migrateRemoteWorkspace({ db, storage, ...f, apply: true })).rejects.toThrow("online_workspace_source_scope_unproven");
+    expect(readRemoteWorkspaceAuthority((await workspace(f.workspaceId)).metadata)).toBeNull();
   });
   it.each(["unregistered", "backlink", "pointer", "symlink-backlink"])("refuses a nested Git wrapper with an unproven linked %s", async mode => {
     const { f, nested } = await nestedGitWrapperFixture(), issueId = randomUUID();
