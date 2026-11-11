@@ -20,6 +20,7 @@ import { captureRemoteWorkspaceFiles, readRemoteWorkspaceFile } from "./remote-w
 import { taskFaultSchedule } from "./scheduler.js";
 import { g1ChildTitle, g1Decision, workloadDefinitions, type WorkloadAgents } from "./workloads.js";
 import { databaseUrlFromConfig, journeyDriverFor, type JourneyDriver } from "./journey-driver.js";
+import { withLiveStatusEvidence } from "./live-status-evidence.js";
 
 const IGNORED_DIRECTORIES = new Set([".git", ".bench", "__pycache__", "node_modules"]);
 const MAX_SNAPSHOT_FILES = 2_000;
@@ -548,7 +549,7 @@ export class TaskObserver {
         interruption: toInterruption(issue.interruption), activeRecoveryAction: Boolean(issue.activeRecoveryAction),
         recoveryOwner: issue.activeRecoveryAction?.ownerType ?? null,
         executionBlocker: Boolean(issue.executionBlocker), scheduledRetry: Boolean(issue.scheduledRetry),
-        runs: await Promise.all((runs ?? []).map(toRunSample).map(run => this.runEvidence(run))) };
+        runs: await withLiveStatusEvidence(this.api, this.record.issueId!, await Promise.all((runs ?? []).map(toRunSample).map(run => this.runEvidence(run)))) };
     } catch {
       return { at: now, reachable: false, serverReady: false };
     }
@@ -716,7 +717,9 @@ export class TaskObserver {
     const attempt: RetryAttempt = { at: now, observedRunId, httpStatus: null, accepted: null, error: null };
     if (this.board) {
       const click = await this.board.clickRetry(issueRef, issueId);
-      Object.assign(attempt, { via: "ui", httpStatus: click.httpStatus, accepted: click.accepted, error: click.error, bannerText: click.bannerText });
+      Object.assign(attempt, { via: "ui", httpStatus: click.httpStatus, accepted: click.accepted, error: click.error, bannerText: click.bannerText,
+        ...(click.diagnostics !== undefined ? { diagnostics: click.diagnostics } : {}),
+        ...(click.dismissedDialogs?.length ? { dismissedDialogs: click.dismissedDialogs } : {}) });
       if (click.accepted) attempt.acceptedAt = Math.max(now, Date.now());
       return attempt;
     }
