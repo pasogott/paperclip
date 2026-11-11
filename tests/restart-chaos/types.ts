@@ -21,9 +21,10 @@ export const K4_MIN_HOLD_MS = 120_000;
  * A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them.
  * PV1–PV3 (provider message faults, provider-faults.ts) restart nothing: the task's rule is armed in the Codex shim.
  * "K0" is a `--matrix` baseline cell: the same journey with no fault.
+ * SR1 (session faults, session-faults.ts) restarts nothing: the board replaces the saved session before answering.
  * DF1 (disk-full-faults.ts) restarts nothing either: the task's final workspace saves find the sandbox disk full.
  */
-export type TaskFaultKind = FaultKind | "K13" | "K0" | ProviderFaultKind | DiskFullFaultKind;
+export type TaskFaultKind = FaultKind | "K13" | "K0" | ProviderFaultKind | DiskFullFaultKind | import("./session-faults.js").SessionFaultKind;
 
 /**
  * G1: an approval-gated action across a restart. H1: a budget hard stop crossed mid-run with a restart (its own wave).
@@ -61,6 +62,11 @@ export interface WaveOptions {
   pollMs: number;
   /** `--env daytona`: the immutable runner image (registry/repository@sha256:…). */
   daytonaImage?: string;
+  /** `--daytona-pack-mismatch <image@sha256:…>`: sandboxes start from this
+   * image while the controller keeps `daytonaImage`'s runnerd and provider pack,
+   * so the sandbox's preinstalled pack does not match and every fresh sandbox
+   * takes the provider-pack upload and admission path (staging run 3f317172). */
+  daytonaSandboxImage?: string;
   /** `--env daytona`: vCPU per sandbox (see seed.ts chaosDaytonaShape). */
   daytonaCpu?: number;
   /** `--daytona-reuse-lease`: the chaos environment keeps its sandboxes between turns (a per-turn run stops and keeps its sandbox). */
@@ -121,6 +127,8 @@ export interface WaveOptions {
   providerFaults?: ProviderFaultKind[];
   /** Sandbox disk-full faults from `--faults` (DF1); see disk-full-faults.ts. */
   diskFullFaults?: DiskFullFaultKind[];
+  /** Session faults from `--faults` (SR1); see session-faults.ts. */
+  sessionFaults?: Array<import("./session-faults.js").SessionFaultKind>;
   providerFaultMessage?: ProviderMessage;
   /** `--provider-fault-message S1=interrupt_ack,...`: a workload's own message, over `providerFaultMessage`. */
   providerFaultMessageByWorkload?: Partial<Record<WorkloadId, ProviderMessage>>;

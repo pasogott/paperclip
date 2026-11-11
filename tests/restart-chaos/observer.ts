@@ -16,6 +16,7 @@ import { restartProcessStartMatches } from "../runner-e2e/process-tree-owner.js"
 import type { UiRetryClick } from "./board-ui.js";
 import { runOracleCommand } from "./oracle-sandbox.js";
 import { awaitingQuestionAnswer, collectQuestionArtifacts, questionStep } from "./question-handoff.js";
+import { isSessionFault, rotateAgentSession } from "./session-faults.js";
 import { captureRemoteWorkspaceFiles, readRemoteWorkspaceFile } from "./remote-workspace-files.js";
 import { taskFaultSchedule } from "./scheduler.js";
 import { g1ChildTitle, g1Decision, workloadDefinitions, type WorkloadAgents } from "./workloads.js";
@@ -854,10 +855,12 @@ export class TaskObserver {
     if (this.plan.workload === "G1") await this.approvalStep(sample, now);
     if (this.plan.workload === "H1") await this.budgetStep(sample, now);
     if (this.plan.workload === "Q1" || this.plan.workload === "Q4") {
+      const sessionFault = isSessionFault(this.plan.fault) ? this.plan.fault : null;
       await questionStep({ api: this.api, issueId: this.record.issueId, nonce: this.plan.nonce, record: this.record, sample, now,
         // An `answered` fault waits for the answer, so the board may answer before it fires.
         boardMayAct: this.boardMayAct(sample, "answered"), sequence: this.plan.workload === "Q4",
-        note: (kind, data) => this.timeline.add(kind, { taskId: this.plan.taskId, ...data }) });
+        note: (kind, data) => this.timeline.add(kind, { taskId: this.plan.taskId, ...data }),
+        ...(sessionFault ? { beforeAnswer: () => rotateAgentSession(this.api, this.lab.agents[this.plan.adapter].id, this.plan.index, now, sessionFault) } : {}) });
     }
   }
 

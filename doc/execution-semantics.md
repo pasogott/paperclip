@@ -1358,8 +1358,12 @@ same-run bootstrap retry, and leaves an active board recovery action that asks
 for a supported model. A definite rejection whose startup `providerFailure`
 is `requires_action` for `authentication`, `permission` or `invalid_request`
 stops on its first attempt as `native_provider_startup_rejected`. On a remote
-execution target, any definite rejection with a startup `providerFailure` stops
-the same way, because a remote same-run bootstrap cannot prove ownership. No
+execution target, another definite rejection with a startup `providerFailure`
+retries on the same run only when the Runner transport proved, at close, that
+the failed runner settled and its process exited (`runnerExitConfirmed` in the
+saved failure). Restart recovery then launches a new runner. A rejection
+without that proof, or one that repeats the previous attempt's startup error,
+stops as `native_provider_startup_rejected`; the repeat names that error. No
 provider work began, so the board offers Retry, which starts a new run with a
 fresh provider session. Other local `session.open` rejections keep the bounded
 startup retry and end with Retry when it is spent. An
@@ -1453,6 +1457,16 @@ reconciler settles; a retry neither reuses nor abandons it. The task shows the
 provider failure as the reason, retries automatically, and on exhaustion becomes
 `blocked` with a specific recovery notice and a Retry. Because no provider work
 started, no execution-reconciliation hold is created.
+
+Lease acquisition precedes provider work by construction, so the same budget
+covers every lease acquisition failure that carries structured transient evidence,
+not only a provider status: the provider's acquisition deadline or an unfinished
+provisional creation (the validated acquisition diagnostic the runtime recorded
+for that run), the plugin RPC deadline, and a database driver error while the
+lease is recorded. A definite non-transient status (for example HTTP 401 or 404)
+still fails as `setup_failed`. On exhaustion the task's recovery action is
+system-owned (cause `environment_provider_unavailable`), not a board escalation:
+nothing needs board repair, and the task's Retry starts a new acquisition.
 
 A saved workspace that cannot be restored into a new allocation before provider
 dispatch fails with `remote_workspace_restore_failed`. The run error names the
@@ -3019,6 +3033,18 @@ drops and other unclassified resume failures keep the existing retry and
 replacement behavior. When a replacement does archive remote continuity state
 and the remote move fails, the local state is not moved, and the run error keeps
 the bounded, redacted exit status and output of that move.
+
+When the provider state backup fails to save after the run's result was
+accepted, and the run used a per-turn sandbox (no reusable lease), that backup
+was the only copy of the provider session. The server records
+`nativeProviderStateUnsaved` with the code `native_provider_state_incompatible`
+in that run's runner profile. The run's status, result and task outcome do not
+change. The next run on the session does not rebind that checkpoint: it starts
+a fresh provider session in the same workspace with the full task context,
+without first trying to resume, and its transcript shows the session as started
+rather than resumed. A failure before the result is accepted, a backup that
+saves after a retry, a retained sandbox, an SSH host, and records saved without
+the key keep the resume path described next.
 
 A Runner that keeps no control-plane state for the saved session (none is live
 and no archived authority epoch matches it) reports a typed refusal. This
@@ -4926,8 +4952,12 @@ and identify `inheritedFromRunId`. The first receipt is immutable history.
 `nativeProviderPackAdmissionState` separately describes current admission proof:
 `pending`, `verified` or `unknown`, with an opaque admission epoch. The mandatory
 coordinator claim atomically sets a new pending epoch before session admission.
-Only the matching owner and epoch can publish post-attachment proof. Failed
-receipt writes leave pending evidence; changed or unsupported admission leaves
+Only the matching owner and epoch can publish post-attachment proof. A write
+that waits for its claim retries a contended write (lock timeout, deadlock or
+serialization abort) up to five times, because the runner's durable checkpoint
+writes hold the same coordinator row. Each attempt re-proves the claim, run and
+epoch in a new transaction. The run log names the database cause of a write
+that still fails. Failed receipt writes leave pending evidence; changed or unsupported admission leaves
 unknown evidence and does not prevent authorized execution. A missing legacy
 receipt remains unknown; the current release cannot supply that missing history.
 Retained recovery needs positively verified prior provenance, captured before
