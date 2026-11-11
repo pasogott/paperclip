@@ -235,6 +235,15 @@ Workspace readiness accepts a completed operation enclosed by a successful
 finalize from the same company, workspace, issue, and run. A nested snapshot
 that finishes before that finalize finishes does not leave a permanent wait.
 Unfinished operations and work after the finalize still require a later save.
+Saved-work recovery ("Recover saved files") ends with its own successful
+finalize for the recovered run. That finalize settles the task's finished
+workspace operations from the same run that started before it, including on a
+workspace that a legacy done child shares with its parent. So the dependents
+of a recovered done child stop waiting, and a saved Retry starts on the next
+dependency pass. Recovery finalizes already saved by earlier releases count,
+with no migration. The recovery finalize never counts as a workspace-wide
+save: another task that started work on a shared workspace while the recovery
+waited for sandbox teardown still waits for its own save.
 
 Daytona file export can preserve an already captured workspace archive when the
 guarded download copy runs out of sandbox capacity. It removes partial copies,
@@ -4648,7 +4657,16 @@ recovery then reclaims the retained sandbox's inactive provider cache and saves 
 files again with no provider turn. The export Retry stays available. A read-only
 fallback that only lost its connection (a closed transport, a provider 5xx or rate
 limit, or a sandbox state change) reports its own cause instead, and finalization
-keeps its bounded retry for it.
+keeps its bounded retry for it. When saved-work recovery's own save still finds the
+disk full after a confirmed reclaim, or with nothing to reclaim, the recovery
+generation ends at once as
+`export_interrupted` with cause `sandbox_disk_full` (retry class
+`user_action_required`) and goes to the board. It is not retried on the automatic
+schedule, and it never falls back to the last save, so the run's unsaved files stay
+in the retained sandbox and the workspace keeps its previous saved version. The
+board's Retry saves again; once the save succeeds, the accepted Retry starts one run.
+A reclaim whose outcome is unknown keeps the scheduled retry, because its journal
+resumes on the next attempt and can still free space.
 
 Native assigned app tools save governed responses above 500,000 encoded bytes before returning
 a bounded reference through PRP. `read_tool_result` retrieves the saved JSON in
