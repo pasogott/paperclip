@@ -1355,8 +1355,15 @@ provider cannot run the selected model (`requested_model_unsupported`,
 `grok_model_mismatch`) is a model rejection, not a startup interruption. It
 stops on its first attempt as `native_provider_model_rejected`, with no
 same-run bootstrap retry, and leaves an active board recovery action that asks
-for a supported model. Other `session.open` rejections keep the bounded
-startup retry. An indeterminate `session.open` outcome stays unclassified.
+for a supported model. A definite rejection whose startup `providerFailure`
+is `requires_action` for `authentication`, `permission` or `invalid_request`
+stops on its first attempt as `native_provider_startup_rejected`. On a remote
+execution target, any definite rejection with a startup `providerFailure` stops
+the same way, because a remote same-run bootstrap cannot prove ownership. No
+provider work began, so the board offers Retry, which starts a new run with a
+fresh provider session. Other local `session.open` rejections keep the bounded
+startup retry and end with Retry when it is spent. An
+indeterminate `session.open` outcome stays unclassified.
 
 ### Workspace scan failures before provider startup
 
@@ -1433,11 +1440,13 @@ status, errno-style code), never by provider text. On exhaustion, the task gets 
 specific recovery notice, and generic recovery does not grant another budget.
 
 An environment provider that refuses a new lease with a transient status (HTTP
-408, 425, 429, 500, 502, 503 or 504, or a closed connection errno) before provider
-dispatch uses the same bounded bootstrap budget (`environment_provider_unavailable`).
-The status comes only from structured fields: the worker's validated acquisition
-envelope or the in-process error's status; message text is never parsed, and
-other statuses stay `setup_failed`. Each retry is a new creation attempt with its
+408, 425, 429, 500, 502, 503 or 504, or a closed connection errno), or whose
+acquisition reached its own deadline, before provider dispatch uses the same
+bounded bootstrap budget (`environment_provider_unavailable`). The status comes
+only from structured fields: the worker's validated acquisition envelope, its
+acquisition diagnostic (a first failure at or after the expired budget), or the
+in-process error's status; message text is never parsed, and other statuses and
+earlier setup failures stay `setup_failed`. Each retry is a new creation attempt with its
 own durable creation record and provider name. A provisional allocation whose
 cleanup could not be confirmed stays owned by its own record, which the creation
 reconciler settles; a retry neither reuses nor abandons it. The task shows the
@@ -3022,6 +3031,24 @@ ends with `native_provider_state_incompatible`, and Retry or the next message
 continues in a fresh provider session in the same workspace. A session with
 work in flight keeps the unclassified behavior.
 
+A follow-up after a governed wait (`allow_replacement_after_governed_wait`)
+normally requires the same provider session. For this one refusal it continues
+on its own in a fresh provider session in the same run, without a Retry, when
+all of these hold: the driver reports the Runner's typed missing-state refusal
+for a session with nothing in flight; the reconciled checkpoint is the untouched
+rebind of the previous run (no cursor progress, turn, runtime request, proposed
+result, terminal, or governed wait of the follow-up run, and the at-most-once
+recovery marker present); and the control plane proves from durable rows,
+across every runner instance, that the follow-up run has no provider event,
+source-sequenced runner event, tool invocation, or accepted result. The follow-up
+has not started a turn, so a fresh session cannot repeat provider work or a tool
+side effect; only the earlier conversation context is lost. The fresh session
+gets the full task prompt, the interaction responses, the stored fresh-session
+handoff, and queued input, as any replacement does, and the run log records the
+existing provider session continuity break with the reason. Any other
+incompatible state, a control plane without that proof, or a checkpoint saved
+without those fields keeps `native_provider_state_incompatible` and its Retry.
+
 Bootstrap retries, exact-checkpoint resumes, and fresh replacement sessions share three total provider attempts, including the original attempt. Linked run IDs, controller restarts, and duplicate wakes do not reset this budget. A resume after a graceful shutdown drain suspended the run for reattachment does not consume an attempt, because the run did not cause that restart. A crash restart (no drain record) consumes an attempt only when the attempt it interrupted spent provider work without progress. This is one rule over recorded outcomes, not over intents. The attempt counts as started only when the provider accepted a turn: a `turn.accepted` event or the provider's own `turn.started`. A startup still marked `beforeSpawn`, a runner that spawned but was never admitted, and a `turn.start` the provider did not accept are not charged. Progress means that an accepted turn then completed work: a tool execution or a completed item other than a usage report. An accepted turn with only usage, a failure, or no events is charged, so a resume that fails each time still uses up the budget. The first restart judges the original execution. Each later restart claim records the run's event-log position, and the next claim judges only the attempt recorded after it; a normal retry in between starts a new attempt (at its `native.process_start_requested`), so earlier work does not count for it. A reattachment adopts a provider that already started, so for it only progress counts. A resume that launches a new runner and that the controller died before starting used no provider work, so the next claim replaces it and the attempt ends at the attempt that resume was to run as. Uncharged restarts stop after 12 controller generations, so a crash loop that never starts the provider, or that makes progress and then crashes the controller each time, is still bounded. Legacy runs follow the same rule: a preparation interrupted before provider work started (`providerWorkStarted: false`) is retried in its own `interrupted_preparation` lane, which never spends the failure retry budget and is bounded at 12 retries. This holds for a hard kill as well as a graceful drain: once the killed controller's recorded process is proven gone, restart recovery fails the run as `process_lost` with the bootstrap certificate and schedules it in that lane. A run saved by an older release without a controller process stamp cannot be proven and stays in the charged lane. Exact-checkpoint resumes retain the 30-second delay. Replacement scheduling and predecessor lineage commit together, with one successor per predecessor and admission through the normal task locks, authorization, pause, approval, and budget gates.
 
 A due failed remote retry can retain its provider PID after heartbeat completion
@@ -4596,6 +4623,10 @@ If shutdown cannot be proven, the run retains its checkpoint and the named
 `native_governed_wait_settlement_pending` condition. The existing bounded
 same-run recovery schedule owns further settlement; it grants no replacement
 or tool replay. The task explains that work is saved and shutdown is pending.
+The active recovery action that schedules this same run's resume is the
+authority for that resume, not a hold against it: the dispatch gate of the
+resumed run (including a resolved-interaction continuation) skips only that
+action and keeps every other reconciliation hold on the task.
 Exhausted or gated recovery holds continuation and names the shutdown problem.
 Actual provider failures and integrity failures retain their existing meaning.
 Accounting keeps its separate receipt and reconciliation requirements.
@@ -4666,7 +4697,18 @@ generation ends at once as
 `user_action_required`) and goes to the board. It is not retried on the automatic
 schedule, and it never falls back to the last save, so the run's unsaved files stay
 in the retained sandbox and the workspace keeps its previous saved version. The
-board's Retry saves again; once the save succeeds, the accepted Retry starts one run.
+board's Retry saves again. Once the save succeeds, the accepted Retry applies the
+run's saved accepted result and finishes the run and task from it, with no new
+agent turn and no provider spend. Retry admission waits (`finalizing_saved_result`)
+while any saved-work hold of that run is still saving, then preserved-result
+finalization coalesces the Retry into the source run (`finalize_result`, activity
+`issue.saved_result_finalization_resumed`). This applies to any accepted Retry
+(`evaluate`) of a terminal run whose coordinator still holds an accepted,
+succeeded result, whose saved-work recovery completed with a verified receipt,
+and which has no recorded Stop, newer run, current execution or other owner. A
+record that lacks any of these, including one written by an older server, keeps
+the previous behaviour: the Retry starts one run. If the save still finds the
+disk full, the hold rests again as `sandbox_disk_full` with its Retry.
 A reclaim whose outcome is unknown keeps the scheduled retry, because its journal
 resumes on the next attempt and can still free space.
 
