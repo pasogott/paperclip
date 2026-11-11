@@ -6252,11 +6252,15 @@ async function migrateRunnerdStateRootForExecution(input: {
         await verifyPluginRunnerTaskReattachment(target.runnerTask, identity);
         return;
       }
-      await verifyRemoteRunnerOrSettledExit({
-        claim: input.restartRecovery, target: input.runnerExecutionTarget, identity,
-        runId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
-        providerAttempt: input.restartRecovery.providerAttempt,
-      });
+      try {
+        await verifyRemoteRunnerOrSettledExit({
+          claim: input.restartRecovery, target: input.runnerExecutionTarget, identity,
+          runId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
+          providerAttempt: input.restartRecovery.providerAttempt,
+        });
+      } catch (error) {
+        throw withRemoteRunnerTurnProof(error, scoped);
+      }
       return;
     }
     if (durableIdentityMatchesExecution(identity, input.execution)) {
@@ -6856,6 +6860,20 @@ export async function stopStaleRemoteRunnerBeforeBootstrap(input: {
       error instanceof Error ? error.message : String(error)}\n`);
     return "stop_failed";
   }
+}
+
+/**
+ * A refused reattachment whose Runner process is proven gone records whether
+ * this run's controller journal proves that no turn command was ever issued.
+ * The controller writes each turn command there before sending it, so only
+ * that positive record (never an absence of run events) allows an automatic
+ * relaunch that cannot repeat provider work.
+ */
+export function withRemoteRunnerTurnProof(error: unknown, root: string): unknown {
+  const diagnostic = readRemoteRunnerRecoveryError(error);
+  if (diagnostic?.stage !== "process_verification" || diagnostic.reason !== "process_not_running" ||
+      !runnerdStateProvesNoRemoteProviderTurn(root)) return error;
+  return attachRemoteRunnerRecoveryDiagnostic(error, { ...diagnostic, providerTurnIssued: false });
 }
 
 /** The remote controller record proves its runner was never sent a turn. */
@@ -11895,7 +11913,9 @@ async function executePaperclipNativeSessionAttempt(
                 // the work-based budget (provider-attempt-outcome.ts).
                 payload: { hostname: hostname(), providerAttempt: attempt, requestedAt: new Date().toISOString() },
               });
-              crashPoint("native.process_start.after_requested_before_spawn");
+              // Fail mode (restart chaos only) is a runnerd start that failed before the process existed.
+              crashPoint("native.process_start.after_requested_before_spawn", { fail: () => Object.assign(
+                new Error("spawn paperclip-runnerd EAGAIN"), { code: "EAGAIN", syscall: "spawn paperclip-runnerd" }) });
             },
             input: runnerExecution,
             startup: executionContext && (!usesPluginTask || executionContext.pluginSupported) ? executionContext : undefined,
