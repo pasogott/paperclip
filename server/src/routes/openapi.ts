@@ -1462,6 +1462,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/attention/{sourceKind}/{sourceId}/transfer",
   "POST /api/approvals/{id}/cancel",
   "POST /api/issues/{id}/interactions/{interactionId}/dismiss",
+  // Cancelling a question is board-only (routes/issues.ts rejects agent actors). Withdraw is not listed here: its
+  // route admits the card's creator agent and the task's assignee, so agents withdraw their own pending card there.
+  "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/retry",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
   "PUT /api/companies/{companyId}/prompt-injection-prevention",
@@ -1557,7 +1560,6 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
-  "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "POST /api/companies/{companyId}/tools/examples/{id}/smoke",
   "POST /api/agents/me/connections/{connectionId}/token",
   "GET /api/tools/oauth/callback",
@@ -8676,7 +8678,7 @@ registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/resolve-from-comment",
   tags: ["issues"],
-  summary: "Record a user's conversational confirmation answer",
+  summary: "Record a user's conversational confirmation answer, including a decline of a card the person created",
   description: "An eligible active agent run resolves a confirmation on its own task using the latest user comment. Resolver permissions, target staleness and conversation reset boundaries remain enforced. Matching retries are idempotent. No new wake is scheduled.",
   request: {
     params: z.object({ id: z.string(), interactionId: z.string() }),
@@ -8758,7 +8760,7 @@ registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/withdraw",
   tags: ["issues"],
-  summary: "Withdraw a pending issue thread interaction",
+  summary: "Withdraw a pending issue thread interaction. For agents, withdraw is only for the agent's own obsolete card; to accept or decline a confirmation card on the person's explicit instruction, an agent records the person's comment with POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment when the card's resolver policy allows (not for question forms or governed approvals)",
   request: {
     params: z.object({ id: z.string(), interactionId: z.string() }),
     body: jsonBody(withdrawIssueThreadInteractionSchema),
@@ -11489,7 +11491,7 @@ registerCurrentRoute({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/cancel",
   tags: ["issues"],
-  summary: "Cancel an issue question interaction",
+  summary: "Cancel an issue question interaction (board users only). Agents: POST /api/issues/{id}/interactions/{interactionId}/withdraw is only for the agent's own obsolete card; to accept or decline a confirmation card on the person's explicit instruction, an agent records the person's comment with POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment when the card's resolver policy allows (not for question forms or governed approvals)",
   body: cancelIssueThreadInteractionSchema,
 });
 
@@ -11512,7 +11514,7 @@ registerCurrentRoute({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/withdraw",
   tags: ["issues"],
-  summary: "Withdraw a pending issue thread interaction",
+  summary: "Withdraw a pending issue thread interaction. For agents, withdraw is only for the agent's own obsolete card; to accept or decline a confirmation card on the person's explicit instruction, an agent records the person's comment with POST /api/issues/{id}/interactions/{interactionId}/resolve-from-comment when the card's resolver policy allows (not for question forms or governed approvals)",
   body: withdrawIssueThreadInteractionSchema,
 });
 
@@ -11932,6 +11934,17 @@ registerCurrentRoute({
   method: "get", path: "/api/companies/{companyId}/observability", tags: ["agent-observability"],
   summary: "Read masked company agent export settings; board connection managers only",
   responses: { 200: r.ok(observabilitySettingsEnvelopeSchema), 401: r.unauthorized, 403: r.forbidden },
+});
+registerCurrentRoute({
+  method: "get", path: "/api/companies/{companyId}/observability/status", tags: ["agent-observability"],
+  summary: "Read whether the company's agent trace export (observability to an OTLP collector or Braintrust) is configured and enabled",
+  description: "Readable by the company's agents and members. Reports whether company agent trace export to an OpenTelemetry (OTLP) collector or Braintrust is configured, enabled, has saved credentials, and the result of its latest delivery test. It never returns the destination or any credential. "
+    + "Use it to answer what is saved for the company's trace export or test collector; agent configuration and company secrets do not hold these settings. Board connection managers change them in Company settings, Agent observability, at /<prefix>/company/settings.",
+  responses: { 200: r.ok(z.object({
+    configured: z.boolean(), enabled: z.boolean(), provider: z.enum(["otlp", "braintrust"]).nullable(),
+    credentialsConfigured: z.boolean(), updatedAt: z.string().datetime().nullable(),
+    lastTest: z.object({ status: z.enum(["accepted", "partial", "failed"]), finishedAt: z.string().datetime() }).strict().nullable(),
+  }).strict()), 401: r.unauthorized, 403: r.forbidden },
 });
 registerCurrentRoute({
   method: "put", path: "/api/companies/{companyId}/observability", tags: ["agent-observability"],

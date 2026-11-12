@@ -21,7 +21,7 @@ import { startAgentLifecycle } from "./services/agent-lifecycle.js";
 import { idleAdmissionMiddleware, trackIdleRequestHandlers } from "./middleware/idle-admission.js";
 import { databaseOperationMiddleware } from "./middleware/database-operation.js";
 import { staticUiFiles } from "./middleware/static-ui.js";
-import { retainedUiAssets } from "./retained-ui-assets.js";
+import { publishRetainedUiAssetsAtStartup, retainedUiAssets } from "./retained-ui-assets.js";
 import { createStorageProviderFromConfig } from "./storage/provider-registry.js";
 import { loadStorageConfig } from "./storage/config.js";
 import { isIdleTaskDrainActive, trackIdleWork } from "./services/task-admission.js";
@@ -226,6 +226,7 @@ import { chatInboundWakeNoticeWork } from "./services/chat-inbound-wake-notice-w
 import { chatFailedRetryNoticeWork } from "./services/chat-failed-retry-notice-work.js";
 import { chatRunMilestoneWork } from "./services/chat-run-milestone-work.js";
 import { heartbeatService } from "./services/heartbeat.js";
+import { registerInterruptedTurnChatRetry } from "./services/heartbeat/restart-interrupted-turn.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { registerPluginLifecycleDelivery } from "./services/plugin-lifecycle-delivery.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
@@ -603,6 +604,8 @@ export async function createApp(
     storage: opts.storageService,
   });
   if (opts.budgetResumeDelivery) opts.budgetResumeDelivery.prepareChatRetry = chatChannels.prepareFailedChatRunRetry;
+  // A restart's automatic Retry of a connected conversation needs the same callback.
+  registerInterruptedTurnChatRetry(chatChannels.prepareFailedChatRunRetry);
   // Voice capabilities are verified by the signed callback route, not by
   // board/agent bearer authentication. Mount before actorMiddleware so its
   // per-session Bearer cannot be mistaken for an agent API key.
@@ -1010,6 +1013,7 @@ export async function createApp(
     },
   );
   runtimePluginLoader = loader;
+  workerManager.setActivationTimeoutRecovery?.(plugin => loader.requestActivationTimeoutRecovery(plugin));
   const browserUse = browserUseService(db, undefined,
     { cancelWorkForScope: heartbeatService(db, { pluginWorkerManager: workerManager }).cancelBudgetScopeWork },
     (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
@@ -1106,7 +1110,8 @@ export async function createApp(
       );
       if (process.env.PAPERCLIP_SHARED_UI_ASSETS === "true") {
         const retained = retainedUiAssets(createStorageProviderFromConfig(loadStorageConfig()));
-        await retained.publish(path.join(uiDist, "assets"));
+        await publishRetainedUiAssetsAtStartup(retained, path.join(uiDist, "assets"), error =>
+          logger.error({ err: error }, "Shared UI assets could not be published because storage is unavailable; serving this build from local files"));
         staticUi.use("/assets", retained.serve);
       }
       // Serve root/index through the same runtime HTML transform as SPA routes.
@@ -1400,6 +1405,7 @@ export async function createApp(
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = finishServiceShutdown(() => scheduler.stop(), async () => {
+      await loader.stopActivationTimeoutRecovery();
       await agentLifecycle.stop();
       unregisterMcpOwners();
       await publicMcpEvents?.stop();
