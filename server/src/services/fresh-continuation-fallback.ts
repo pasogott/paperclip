@@ -77,6 +77,7 @@ export const FRESH_CONTINUATION_PENDING_BOUND_MS = 10 * 60_000;
 export const FRESH_CONTINUATION_PROGRESS_BOUND_MS = 15 * 60_000;
 /** Saved-work recovery that is running and advancing keeps its own budget. */
 export const FRESH_CONTINUATION_SAVED_WORK_BOUND_MS = 30 * 60_000;
+export const NATIVE_INTERRUPTION_NO_PROGRESS_DEADLINE_MS = FRESH_CONTINUATION_PROGRESS_BOUND_MS;
 const EXACT_RECOVERY_RECHECK_MS = 60_000;
 
 /**
@@ -326,6 +327,7 @@ const blocksExecution = (hold: typeof issueRecoveryActions.$inferSelect) =>
 
 /** A reconciliation hold that blocks the task and that this decision settles. */
 function isOwnedReconciliationHold(hold: typeof issueRecoveryActions.$inferSelect) {
+  if (hold.kind === "stranded_assigned_issue") return false;
   if (!(EXECUTION_RECONCILIATION_CAUSES as readonly string[]).includes(hold.cause) || !blocksExecution(hold)) return false;
   if (isHumanGate(hold)) return false;
   // A restore hold is owned only once its saved-work recovery completed.
