@@ -2465,7 +2465,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (countsRecovery || (agedOldest && facts.length > 1)) {
       const oldestRecoveryAt = countsRecovery ? Math.min(...recoveryRuns.map(entry => entry.createdAt.getTime())) : Infinity;
       const since = new Date(Math.min(oldestRecoveryAt, agedOldest?.createdAt.getTime() ?? Infinity));
-      const recentStarts = await db.select({ wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'`,
+      const recentStarts = await db.select({ id: heartbeatRuns.id, wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'wakeReason'`,
         startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id),
@@ -2475,7 +2475,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const startsSince = (at: number) => recentStarts.filter(row => row.startedAt && row.startedAt.getTime() >= at);
       if (countsRecovery) {
         const starts = startsSince(oldestRecoveryAt).slice(0, RECOVERY_DISPATCH_SHARE);
-        const lastRecovery = starts.findIndex(row => isRecoveryWakeReason(row.wakeReason));
+        const recoveryStartIds = starts.flatMap(row => isRecoveryWakeReason(row.wakeReason) ? [row.id] : []);
+        const personStarts = new Set(recoveryStartIds.length
+          ? await listPersonOriginSourceRunIds(agent.companyId, recoveryStartIds) : []);
+        const lastRecovery = starts.findIndex(row => isRecoveryWakeReason(row.wakeReason) && !personStarts.has(row.id));
         startsSinceRecovery = lastRecovery < 0 ? starts.length : lastRecovery;
       }
       if (agedOldest && facts.length > 1) {
@@ -2589,17 +2592,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           noteDeclinedAgedClaim(queuedRun, err.message);
           continue;
         }
-        if (claimed) {
-          claimedRuns.push(claimed);
-          dispatcher.claimed(queuedRun);
-          declinedAgedClaimAt.delete(queuedRun.id);
-        } else {
+        if (!claimed) {
           noteDeclinedAgedClaim(queuedRun, "claim_declined");
+          continue;
         }
+        claimedRuns.push(claimed);
+        dispatcher.claimed(queuedRun);
+        declinedAgedClaimAt.delete(queuedRun.id);
+        // Start each run as soon as it is claimed. The claim committed a legacy
+        // controller lease that only the run's own execution renews; waiting
+        // for the rest of a slow batch to be claimed let that lease lapse.
+        startClaimedRun(claimed);
       }
-      if (claimedRuns.length === 0) return [];
+      return claimedRuns;
 
-      for (const claimedRun of claimedRuns) {
+      function startClaimedRun(claimedRun: typeof heartbeatRuns.$inferSelect) {
         const execution = executeRun(claimedRun.id).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },
@@ -2617,7 +2624,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           activeRunExecutionPromises.delete(execution);
         });
       }
-      return claimedRuns;
     }).finally(async () => {
       // Dispatch promoted inputs after the agent start lock is released.
       try {
