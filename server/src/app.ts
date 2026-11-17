@@ -179,6 +179,7 @@ import {
 } from "./routes/instance-database-backups.js";
 import { llmRoutes } from "./routes/llms.js";
 import { authRoutes } from "./routes/auth.js";
+import { resolvePostHogProxyMount } from "./routes/posthog-proxy.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
@@ -233,6 +234,7 @@ import { chatRunMilestoneWork } from "./services/chat-run-milestone-work.js";
 import { heartbeatService } from "./services/heartbeat.js";
 import { registerInterruptedTurnChatRetry } from "./services/heartbeat/restart-interrupted-turn.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
+import { loadPluginAppCatalog } from "./services/plugin-app-catalog.js";
 import { registerPluginLifecycleDelivery } from "./services/plugin-lifecycle-delivery.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import {
@@ -534,6 +536,10 @@ export async function createApp(
   // Default is unset → Express trusts nothing, which is the only safe choice
   // when the server may be reachable without a known reverse proxy in front.
   applyTrustProxy(app, parseTrustProxyEnv(process.env.TRUST_PROXY));
+  // Browser analytics on Paperclip Cloud only. Mounted before every body
+  // parser so PostHog payloads stream through unread; see routes/posthog-proxy.ts.
+  const posthogProxy = resolvePostHogProxyMount(process.env);
+  if (posthogProxy) app.use(posthogProxy.path, posthogProxy.router);
 
   app.use(
     COMPANY_IMPORT_API_PATH,
@@ -911,6 +917,9 @@ export async function createApp(
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
   const lifecycle = pluginLifecycleManager(db, { workerManager });
+  // Seed the plugin-provided connector lookups; readers refresh them again
+  // from the plugins table whenever they need a current answer.
+  void loadPluginAppCatalog(db).catch((error) => logger.warn({ err: error }, "Could not load plugin connector catalog"));
   const scheduler = createPluginJobScheduler({
     isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive(),
     db,
