@@ -6,6 +6,8 @@ export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export const ISSUE_SUMMARIES_MAX_IDS = 50;
 /** Tasks per chat bootstrap request. The list preloads larger sets in chunks. */
 export const ISSUE_CHAT_BOOTSTRAP_MAX_IDS = 10;
+/** Tasks per keyed bulk document read; keeps a routine's case inventory in one request. */
+export const ISSUE_DOCUMENT_BATCH_MAX_IDS = 200;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
@@ -372,6 +374,7 @@ export const TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND = "task_watchdog_product_bug"
 // Marks the single onboarding "first task" so surfaces can special-case it
 // (e.g. suppress the seeded-description bubble and rely on a seeded greeting).
 export const ONBOARDING_FIRST_TASK_ORIGIN_KIND = "onboarding_first_task";
+export const ONBOARDING_CHAT_ORIGIN_KIND = "onboarding_chat";
 
 export const ISSUE_ORIGIN_KINDS = [
   "manual",
@@ -384,6 +387,7 @@ export const ISSUE_ORIGIN_KINDS = [
   "task_watchdog",
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
+  ONBOARDING_CHAT_ORIGIN_KIND,
   "chat_channel",
 ] as const;
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
